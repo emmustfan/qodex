@@ -93,6 +93,27 @@ def init():
           scenario TEXT NOT NULL, name TEXT NOT NULL, rows TEXT NOT NULL,
           author TEXT NOT NULL, UNIQUE(month,basis,scenario,name)
         );
+        CREATE TABLE IF NOT EXISTS funds (
+          id INTEGER PRIMARY KEY, entity INTEGER NOT NULL CHECK(entity IN (1,2)),
+          name TEXT NOT NULL COLLATE NOCASE, UNIQUE(entity,name)
+        );
+        CREATE TABLE IF NOT EXISTS profit_decisions (
+          id INTEGER PRIMARY KEY, entity INTEGER NOT NULL CHECK(entity IN (1,2)),
+          month TEXT NOT NULL, day TEXT NOT NULL, note TEXT NOT NULL,
+          amount INTEGER NOT NULL CHECK(amount>0), fund INTEGER REFERENCES funds(id),
+          canceled INTEGER NOT NULL DEFAULT 0 CHECK(canceled IN (0,1)), actor TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS fund_entries (
+          id INTEGER PRIMARY KEY, fund INTEGER NOT NULL REFERENCES funds(id),
+          day TEXT NOT NULL, amount INTEGER NOT NULL CHECK(amount<>0), note TEXT NOT NULL,
+          actor TEXT NOT NULL, decision INTEGER UNIQUE REFERENCES profit_decisions(id)
+        );
+        CREATE INDEX IF NOT EXISTS fund_entries_day ON fund_entries(fund,day);
+        CREATE TABLE IF NOT EXISTS office_contributions (
+          entity INTEGER NOT NULL CHECK(entity IN (1,2)), month TEXT NOT NULL,
+          project TEXT NOT NULL, amount INTEGER NOT NULL CHECK(amount>=0),
+          PRIMARY KEY(entity,month,project)
+        );
         CREATE TABLE IF NOT EXISTS forecast_entries (
           id INTEGER PRIMARY KEY, entity INTEGER NOT NULL, day TEXT NOT NULL,
           description TEXT NOT NULL, amount INTEGER NOT NULL
@@ -392,6 +413,54 @@ def apply_bank_suggestions(db, ids):
     return count
 
 
+def fund_id(db, value, entity=None):
+    fund = int(value)
+    row = db.execute("SELECT entity FROM funds WHERE id=?", (fund,)).fetchone()
+    if not row or (entity is not None and row["entity"] != entity):
+        raise ValueError("Выберите фонд нужного ООО.")
+    return fund
+
+
+def positive_amount(value):
+    amount = money(value)
+    if amount <= 0:
+        raise ValueError("Укажите положительную сумму.")
+    return amount
+
+
+def decision_note(value):
+    note = value.strip()
+    if not note or len(note) > 200:
+        raise ValueError("Укажите основание длиной до 200 символов.")
+    return note
+
+
+def check_fund_balance(db, fund):
+    balance = 0
+    for row in db.execute("""
+        SELECT e.day, SUM(e.amount) AS amount FROM fund_entries e
+        LEFT JOIN profit_decisions d ON e.decision=d.id
+        WHERE e.fund=? AND (d.id IS NULL OR d.canceled=0)
+        GROUP BY e.day ORDER BY e.day
+    """, (fund,)):
+        balance += row["amount"]
+        if balance < 0:
+            raise ValueError(f'Операция даст отрицательный остаток фонда на {row["day"]}.')
+
+
+def add_profit_decision(db, payload, actor):
+    entity = entity_id(payload)
+    fund = fund_id(db, payload["fund"], entity) if payload.get("fund") else None
+    when, amount, note = day(payload["day"]), positive_amount(payload["amount"]), decision_note(payload["note"])
+    decision = db.execute("""
+        INSERT INTO profit_decisions(entity,month,day,note,amount,fund,actor) VALUES(?,?,?,?,?,?,?)
+    """, (entity, month(payload["month"]), when, note, amount, fund, actor)).lastrowid
+    if fund is not None:
+        db.execute("INSERT INTO fund_entries(fund,day,amount,note,actor,decision) VALUES(?,?,?,?,?,?)",
+                   (fund, when, amount, note, actor, decision))
+    return decision
+
+
 def mutate(db, action, payload, actor, role):
     if role != "finance" and action != "request":
         raise PermissionError("Действие доступно финансисту.")
@@ -405,6 +474,49 @@ def mutate(db, action, payload, actor, role):
     elif action == "apply-bank-suggestions":
         result["applied"] = apply_bank_suggestions(db, payload["ids"])
         target = str(result["applied"])
+    elif action == "fund":
+        name = payload["name"].strip()
+        if not name or len(name) > 80:
+            raise ValueError("Укажите название фонда до 80 символов.")
+        entity = entity_id(payload)
+        names = db.execute("SELECT name FROM funds WHERE entity=?", (entity,))
+        if any(row["name"].casefold() == name.casefold() for row in names):
+            raise ValueError("У этого ООО уже есть фонд с таким названием.")
+        target = str(db.execute("INSERT INTO funds(entity,name) VALUES(?,?)", (entity, name)).lastrowid)
+    elif action == "fund-entry":
+        fund = fund_id(db, payload["fund"])
+        direction = payload["direction"]
+        if direction not in ("reserve", "release"):
+            raise ValueError("Выберите пополнение или высвобождение.")
+        amount = positive_amount(payload["amount"]) * (-1 if direction == "release" else 1)
+        target = str(db.execute("""
+            INSERT INTO fund_entries(fund,day,amount,note,actor) VALUES(?,?,?,?,?)
+        """, (fund, day(payload["day"]), amount, decision_note(payload["note"]), actor)).lastrowid)
+        check_fund_balance(db, fund)
+    elif action == "office-contribution":
+        entity, period = entity_id(payload), month(payload["month"])
+        project = payload["project"]
+        if project not in PROJECTS or project == "Офис":
+            raise ValueError("Выберите проект.")
+        amount = money(payload["amount"], allow_zero=True)
+        if amount < 0:
+            raise ValueError("Вклад проекта в офис задаётся неотрицательной суммой.")
+        db.execute("""
+            INSERT INTO office_contributions VALUES(?,?,?,?) ON CONFLICT(entity,month,project)
+            DO UPDATE SET amount=excluded.amount
+        """, (entity, period, project, amount))
+        target = f"{entity}:{period}:{project}"
+    elif action == "profit-decision":
+        target = str(add_profit_decision(db, payload, actor))
+    elif action == "cancel-profit-decision":
+        target = str(int(payload["id"]))
+        decision = db.execute("""
+            UPDATE profit_decisions SET canceled=1 WHERE id=? AND canceled=0 RETURNING fund
+        """, (target,)).fetchone()
+        if not decision:
+            raise ValueError("Действующее решение не найдено.")
+        if decision["fund"] is not None:
+            check_fund_balance(db, decision["fund"])
     elif action == "account":
         name = payload["name"].strip()
         if not name or len(name) > 80:
@@ -599,7 +711,8 @@ class Handler(BaseHTTPRequestHandler):
             with closing(connect()) as db:
                 db.execute("BEGIN")
                 data = {table: [dict(row) for row in db.execute(f"SELECT * FROM {table}")]
-                        for table in ("allocations", "plans", "accruals", "balances", "accounts", "account_balances", "statement_controls", "bank_statements", "transfers", "request_payments", "forecast_entries") if role == "finance"}
+                        for table in ("allocations", "plans", "accruals", "balances", "accounts", "account_balances", "statement_controls", "bank_statements", "transfers", "request_payments", "forecast_entries",
+                                      "funds", "fund_entries", "profit_decisions", "office_contributions") if role == "finance"}
                 if role == "finance":
                     data["operations"] = read_operation_rows(db)
                     data["budget_versions"] = [

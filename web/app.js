@@ -3,7 +3,7 @@ const dialog = document.querySelector('#dialog');
 const nav = document.querySelector('#nav');
 const RUB = new Intl.NumberFormat('ru-RU', {style:'currency',currency:'RUB',maximumFractionDigits:2,minimumFractionDigits:0});
 const MONTHS = ['янв','фев','мар','апр','май','июн','июл','авг','сен','окт','ноя','дек'];
-const tabs = [['overview','▦','Обзор'],['operations','⇄','Операции'],['cash','▤','БДДС'],['calendar','▧','Платёжный календарь'],['forecast','↗','Прогноз денег'],['profit','▥','БДР / P&L'],['requests','✓','Заявки'],['accounts','▱','Счета']];
+const tabs = [['overview','▦','Обзор'],['operations','⇄','Операции'],['cash','▤','БДДС'],['calendar','▧','Платёжный календарь'],['forecast','↗','Прогноз денег'],['profit','▥','БДР / P&L'],['distribution','∑','Распределение прибыли'],['funds','◈','Фонды'],['requests','✓','Заявки'],['accounts','▱','Счета']];
 const nonOperating = ['Финансирование','Дивиденды'];
 let data;
 let view = 'overview';
@@ -180,7 +180,7 @@ function report(basis) {
     return `<tr><td>${esc(article)}</td><td>${rub(plannedAmount)}</td><td>${rub(actualAmount)}</td><td class="${sign(actualAmount-plannedAmount)}">${rub(actualAmount-plannedAmount)}</td></tr>`;
   });
   const extras = cash ? '' : table('Ручные начисления',['Период','Проект','Описание','Сумма'],filterRows(data.accruals.filter(row => inEntity(row.entity))).map(item => `<tr><td>${esc(item.month)}</td><td>${esc(item.project)}</td><td class="wrap">${esc(item.description)}</td><td>${rub(item.amount)}</td></tr>`));
-  return header(cash ? 'БДДС' : 'БДР / P&L',cash ? 'План и факт по датам платежей' : 'План и факт по месяцам начисления',planActions + (cash ? '' : button('+ Начисление','accrual'))) + filters(true,false,cash) + versionFilter
+  return header(cash ? 'БДДС' : 'БДР / P&L',cash ? 'План и факт по датам платежей' : 'План и факт по месяцам начисления',planActions + (cash ? '' : button('+ Начисление','accrual') + button('Распределение прибыли','view:distribution'))) + filters(true,false,cash) + versionFilter
     + `<div class="metrics">${card(cash ? 'Чистый денежный поток' : 'Операционный результат',rub(actual.net),`План ${rub(planned.net)}`)}${card(cash ? 'Поступления' : 'Доходы',rub(actual.incoming),`План ${rub(planned.incoming)}`)}${card(cash ? 'Выплаты' : 'Расходы',rub(actual.outgoing),`План ${rub(planned.outgoing)}`)}${cash ? card('Отклонение потока',rub(actual.net-planned.net),'Факт минус план') : card('Маржа проектов',directTotals.incoming ? `${(directTotals.net/directTotals.incoming*100).toFixed(1)}%` : '—',`Офисные расходы · ${rub(office.outgoing)}`)}</div>`
     + table('План-факт по статьям',['Статья','План','Факт','Отклонение'],rows) + (extras ? '<div style="height:15px"></div>' + extras : '');
 }
@@ -224,19 +224,25 @@ function calendar() {
     + '<div class="calendar-gap"></div>' + table('Просроченные платежи',columns,rows(late),'Просроченных платежей нет.');
 }
 
+function bankBalanceAt(cutoff, accounts, requireAssigned) {
+  const opening = new Map(data.account_balances.filter(row => row.day <= cutoff).map(row => [row.account,row]));
+  if (!accounts.length || accounts.some(item => !opening.has(item.id))
+    || (requireAssigned && data.operations.some(op => !op.account && op.day <= cutoff))) return null;
+  const byAccount = Map.groupBy(data.operations.filter(op => op.day <= cutoff),op => op.account);
+  return accounts.reduce((sum,item) => {
+    const start = opening.get(item.id);
+    const operations = (byAccount.get(item.id) || []).filter(op => op.day >= start.day);
+    return sum + start.amount + totals(operations).net;
+  },0);
+}
+
 function forecast() {
   const today = new Date().toLocaleDateString('sv-SE');
   const horizon = period < today.slice(0,7) ? today.slice(0,7) : period;
   const scope = data.accounts.filter(item => inEntity(item.entity));
-  const opening = new Map(data.account_balances.filter(row => row.day <= today).map(row => [row.account,row]));
-  const unassigned = !entity && data.operations.some(op => !op.account && op.day <= today);
-  const known = scope.length && scope.every(item => opening.has(item.id)) && !unassigned;
-  let running = known ? scope.reduce((sum,item) => {
-    const start = opening.get(item.id);
-    return sum + start.amount + totals(data.operations.filter(op =>
-      op.account === item.id && op.day >= start.day && op.day <= today)).net;
-  },0) : null;
-  const initial = running;
+  const initial = bankBalanceAt(today,scope,!entity);
+  let running = initial;
+  const known = initial !== null;
   const manual = data.forecast_entries.filter(row => inEntity(row.entity) && row.day.slice(0,7) <= horizon);
   const obligations = data.requests.filter(item => item.status === 'Согласована' && inEntity(item.entity)
     && outstanding(item) && dueDate(item).slice(0,7) <= horizon).map(item => ({
@@ -293,6 +299,84 @@ function payments(item) {
     modal('Отвязать списание','<p>Сумма снова появится к оплате. Распределение банковской операции сохранится.</p>',
       () => api('unlink-payment',{operation:control.dataset.detach}));
   });
+}
+
+function entityPeriodFilters() {
+  return `<div class="toolbar"><input type="month" aria-label="Отчётный месяц" id="period" value="${period}">
+    <select id="entity" aria-label="Юридическое лицо"><option value="">Все ООО</option>${idOptions(legalOptions(),entity)}</select></div>`;
+}
+
+function fundsReport() {
+  const funds = data.funds.filter(item => inEntity(item.entity));
+  const fundById = new Map(funds.map(item => [item.id,item]));
+  const canceled = new Set(data.profit_decisions.filter(item => item.canceled).map(item => item.id));
+  const entries = data.fund_entries.filter(item => fundById.has(item.fund) && item.day.slice(0,7) <= period);
+  const active = entries.filter(item => !canceled.has(item.decision));
+  const byFund = Map.groupBy(active,item => item.fund);
+  const reserved = totals(active).net;
+  const monthEnd = new Date(period + '-01T00:00:00Z');
+  monthEnd.setUTCMonth(monthEnd.getUTCMonth() + 1,0);
+  const scope = data.accounts.filter(item => inEntity(item.entity));
+  const balance = bankBalanceAt(monthEnd.toISOString().slice(0,10),scope,!entity);
+  const available = balance === null ? null : balance - reserved;
+  const rows = funds.map(item => {
+    const moves = byFund.get(item.id) || [];
+    const opening = totals(moves.filter(row => row.day.slice(0,7) < period)).net;
+    const current = totals(moves.filter(row => row.day.slice(0,7) === period));
+    return `<tr><td><strong>${esc(item.name)}</strong></td><td>${esc(entityName(item.entity))}</td><td>${rub(opening)}</td>
+      <td>${rub(current.incoming)}</td><td>${rub(current.outgoing)}</td><td><strong>${rub(opening+current.net)}</strong></td>
+      <td>${button('Движение','fund-entry:' + item.id)}</td></tr>`;
+  });
+  const journal = entries.filter(item => item.day.startsWith(period)).sort((a,b) => b.day.localeCompare(a.day) || b.id-a.id).map(item => {
+    const label = canceled.has(item.decision) ? 'Решение отменено' : item.decision ? 'Из прибыли' : item.amount > 0 ? 'Пополнение' : 'Высвобождение';
+    const fund = fundById.get(item.fund);
+    return `<tr><td>${esc(item.day)}</td><td>${esc(fund.name)}<small>${esc(entityName(fund.entity))}</small></td><td>${label}</td>
+      <td class="wrap">${esc(item.note)}<small>${esc(item.actor)}</small></td><td class="${sign(item.amount)}">${rub(item.amount)}</td></tr>`;
+  });
+  return header('Фонды','Резервы денежных средств по ООО',button('+ Фонд','fund',true)) + entityPeriodFilters()
+    + `<div class="metrics">${card('В фондах',rub(reserved),'Остаток резервов к концу месяца')}
+      ${card('Деньги на счетах',balance === null ? '—' : rub(balance),balance === null ? 'Укажите входящие остатки по счетам' : 'По данным банковских операций')}
+      ${card('Свободно после резервов',available === null ? '—' : rub(available),available !== null && available < 0 ? 'Резервы выше остатка на счетах' : 'Остаток на счетах за вычетом фондов')}</div>`
+    + table('Остатки фондов',['Фонд','ООО','На начало','Пополнения','Высвобождено','На конец',''],rows,'Создайте фонд, чтобы начать вести резерв.')
+    + '<div class="calendar-gap"></div>' + table('Журнал фондов',['Дата','Фонд','Движение','Основание','Сумма'],journal);
+}
+
+function distributionReport() {
+  const fact = profitRows().filter(row => row.month === period);
+  const byProject = Map.groupBy(fact,row => row.project);
+  const allocations = data.office_contributions.filter(row => row.month === period && inEntity(row.entity));
+  const officeReceived = totals(allocations).incoming;
+  const projectTotal = totals(fact.filter(row => row.project !== 'Офис'));
+  const office = totals(byProject.get('Офис') || []);
+  const result = projectTotal.net + office.net;
+  const decisions = data.profit_decisions.filter(row => row.month === period && inEntity(row.entity));
+  const active = decisions.filter(row => !row.canceled);
+  const funds = totals(active.filter(row => row.fund)).incoming;
+  const owners = totals(active.filter(row => !row.fund)).incoming;
+  const remaining = result - funds - owners;
+  const pnlRow = (name,amounts,transfer,summary = false) => `<tr class="${summary ? 'summary-row' : ''}">
+    <td><strong>${esc(name)}</strong></td><td>${rub(amounts.incoming)}</td><td>${rub(amounts.outgoing)}</td>
+    <td class="${sign(amounts.net)}">${rub(amounts.net)}</td><td class="${sign(transfer)}">${rub(transfer)}</td>
+    <td class="${sign(amounts.net+transfer)}"><strong>${rub(amounts.net+transfer)}</strong></td></tr>`;
+  const rows = data.projects.filter(name => name !== 'Офис').map(name => {
+    const amount = totals(allocations.filter(row => row.project === name)).incoming;
+    return pnlRow(name,totals(byProject.get(name) || []),-amount);
+  });
+  rows.push(pnlRow('Офис',office,officeReceived),pnlRow('Итого',totals(fact),0,true));
+  const decisionRows = [...decisions].sort((a,b) => b.day.localeCompare(a.day) || b.id-a.id).map(item => {
+    const destination = item.fund ? data.funds.find(fund => fund.id === item.fund)?.name : 'Собственникам';
+    return `<tr><td>${esc(item.day)}</td><td>${esc(entityName(item.entity))}</td><td>${esc(destination)}</td>
+      <td class="wrap">${esc(item.note)}<small>${esc(item.actor)}</small></td><td>${rub(item.amount)}</td>
+      <td>${item.canceled ? '<span class="pill pending">Отменено</span>' : button('Отменить','cancel-profit-decision:' + item.id)}</td></tr>`;
+  });
+  return header('Распределение прибыли','Результат по начислениям, вклад в офис и решения по прибыли',
+    button('Вклад в офис','office-contribution') + button('+ Решение','profit-decision',true)) + entityPeriodFilters()
+    + `<div class="metrics">${card('Результат проектов',rub(projectTotal.net),'До вклада в офис')}
+      ${card('Расходы офиса',rub(office.outgoing),`Вклад проектов ${rub(officeReceived)}`)}
+      ${card('Результат после офиса',rub(result),'По начислениям БДР')}
+      ${card('Остаток после решений',rub(remaining),remaining < 0 && funds + owners > 0 ? 'Решения превышают результат месяца' : `В фонды ${rub(funds)} · Собственникам ${rub(owners)}`)}</div>`
+    + table('Проекты и офис',['Центр','Доходы','Расходы','Результат до вклада','Внутренний вклад','Результат после вклада'],rows)
+    + '<div class="calendar-gap"></div>' + table('Решения по прибыли',['Дата решения','ООО','Направление','Основание','Сумма',''],decisionRows);
 }
 
 function accountReport() {
@@ -358,6 +442,8 @@ function render() {
   if (view === 'calendar') content.innerHTML = calendar();
   if (view === 'forecast') content.innerHTML = forecast();
   if (view === 'accounts') content.innerHTML = accountReport();
+  if (view === 'funds') content.innerHTML = fundsReport();
+  if (view === 'distribution') content.innerHTML = distributionReport();
 }
 
 const field = (label, name, type, value = '', extra = '') => `<label>${label}<input name="${name}" type="${type}" value="${esc(value)}" ${extra}></label>`;
@@ -543,6 +629,48 @@ function doAction(action) {
   const category = (articles = data.articles) => selectField('ООО','entity',legalOptions(),entity) + `<div class="fields">${picker('Проект','project',data.projects,project)}${picker('Статья','article',articles)}</div>`;
   const save = (title,fields) => modal(title,fields,values => api(kind,{...Object.fromEntries(values),basis:arg,scenario}));
   if (kind === 'allocate') allocation(data.operations.find(op => op.id === Number(arg)));
+  if (kind === 'fund') save('Новый фонд',selectField('ООО','entity',legalOptions(),entity)
+    + field('Название фонда','name','text','','maxlength="80" required'));
+  if (kind === 'fund-entry') {
+    const fund = data.funds.find(item => item.id === Number(arg));
+    modal('Движение в фонде',`<p>${esc(entityName(fund.entity))} · ${esc(fund.name)}</p>`
+      + selectField('Движение','direction',[['reserve','Пополнение'],['release','Высвобождение']])
+      + field('Дата','day','date',defaultDate,'required') + amount('','min="0.01"')
+      + field('Основание','note','text','','maxlength="200" required')
+      + '<small>Запись меняет резерв. Платежи по-прежнему отражаются в банковских операциях.</small>',
+      values => api(kind,{...Object.fromEntries(values),fund:fund.id}));
+  }
+  if (kind === 'office-contribution') {
+    const form = modal('Вклад проекта в офис',selectField('ООО','entity',legalOptions(),entity)
+      + picker('Проект','project',data.projects.filter(name => name !== 'Офис'),project)
+      + amount('','min="0"') + '<small>Вклад относится к выбранному месяцу. Ноль снимает распределение. Результат ООО и БДДС сохраняются.</small>',
+      values => api(kind,{...Object.fromEntries(values),month:period}));
+    const update = () => {
+      const now = data.office_contributions.find(row => row.entity === Number(form.elements.entity.value)
+        && row.month === period && row.project === form.elements.project.value);
+      form.elements.amount.value = now ? now.amount / 100 : '';
+    };
+    form.elements.entity.onchange = update;
+    form.elements.project.onchange = update;
+    update();
+  }
+  if (kind === 'profit-decision') {
+    const form = modal('Решение по прибыли',selectField('ООО','entity',legalOptions(),entity)
+      + selectField('Направление','fund',[])
+      + field('Дата решения','day','date',new Date().toLocaleDateString('sv-SE'),'required')
+      + amount('','min="0.01"') + field('Основание','note','text','','maxlength="200" required')
+      + `<small>Результат за ${esc(period)}. Запись в фонд сразу увеличит резерв. Оплату собственникам отразите по выписке.</small>`,
+      values => api(kind,{...Object.fromEntries(values),fund:values.get('fund') === 'owners' ? null : values.get('fund'),month:period}));
+    const update = () => {
+      const choices = data.funds.filter(item => item.entity === Number(form.elements.entity.value));
+      form.elements.fund.innerHTML = idOptions([['owners','Собственникам'],...choices.map(item => [item.id,item.name])]);
+    };
+    form.elements.entity.onchange = update;
+    update();
+  }
+  if (kind === 'cancel-profit-decision') modal('Отменить решение',
+    '<p>Отмена исключит сумму из распределения прибыли. Для фонда остаток пересчитается с даты решения.</p>',
+    () => api(kind,{id:Number(arg)}));
   if (kind === 'account') save('Новый счёт',selectField('ООО','entity',legalOptions(),entity)
     + field('Название счёта','name','text','','maxlength="80" required'));
   if (kind === 'account-balance') {
