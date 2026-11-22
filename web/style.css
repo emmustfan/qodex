@@ -9,3 +9,7 @@
 dialog label.finance-option{display:flex;align-items:center}
 dialog summary{cursor:pointer;font-weight:600}
 dialog details table{margin-top:8px}
+.statement-totals{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:10px;margin:0}
+.statement-totals div{background:#f4f7f3;border-radius:8px;padding:10px}
+.statement-totals dt{font-size:12px;color:var(--muted)}
+.statement-totals dd{margin:4px 0 0;font-weight:700}

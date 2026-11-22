@@ -88,7 +88,7 @@ const accountOptions = () => data.accounts.filter(item => inEntity(item.entity))
 const selectField = (label,name,items,current) => `<label>${label}<select name="${name}" aria-label="${esc(label)}" required>${idOptions(items,current)}</select></label>`;
 
 function filters(withScenario = false, operations = false, showAccount = true) {
-  return `<div class="toolbar"><input type="month" aria-label="Отчётный месяц" id="period" value="${period}"><select id="project" aria-label="Проект"><option value="">Все проекты</option>${options(data.projects,project)}</select><select id="entity" aria-label="Юридическое лицо"><option value="">Все ООО</option>${idOptions(legalOptions(),entity)}</select>${showAccount ? `<select id="bankAccount" aria-label="Банковский счёт"><option value="">Все счета</option>${idOptions(accountOptions(),account)}</select>` : ''}${withScenario ? `<select id="scenario" aria-label="Сценарий бюджета">${options(data.scenarios,scenario)}</select>` : ''}${operations ? `<select id="operationFilter" aria-label="Статус распределения"><option value="all">Все операции</option><option value="pending" ${operationFilter === 'pending' ? 'selected' : ''}>Без распределения</option></select>` : ''}</div>`;
+  return `<div class="toolbar"><input type="month" aria-label="Отчётный месяц" id="period" value="${period}"><select id="project" aria-label="Проект"><option value="">Все проекты</option>${options(data.projects,project)}</select><select id="entity" aria-label="Юридическое лицо"><option value="">Все ООО</option>${idOptions(legalOptions(),entity)}</select>${showAccount ? `<select id="bankAccount" aria-label="Банковский счёт"><option value="">Все счета</option>${idOptions(accountOptions(),account)}</select>` : ''}${withScenario ? `<select id="scenario" aria-label="Сценарий бюджета">${options(data.scenarios,scenario)}</select>` : ''}${operations ? `<select id="operationFilter" aria-label="Статус распределения"><option value="all">Все операции</option><option value="pending" ${operationFilter === 'pending' ? 'selected' : ''}>Без распределения</option><option value="documents" ${operationFilter === 'documents' ? 'selected' : ''}>Ждём документы</option></select>` : ''}</div>`;
 }
 
 function chart(rows) {
@@ -105,15 +105,24 @@ function chart(rows) {
 
 function operationTable(compact = false) {
   const paired = transferMap();
+  const byOperation = Map.groupBy(data.allocations, row => row.operation);
   const items = data.operations.filter(op => {
     if (!inScope(op.account)) return false;
-    const lines = data.allocations.filter(item => item.operation === op.id);
-    return op.day.startsWith(period) && (!project || lines.some(line => line.project === project)) && (operationFilter !== 'pending' || compact || (!lines.length && !paired.has(op.id)));
+    const lines = byOperation.get(op.id) || [];
+    if (!compact && operationFilter === 'documents' && !op.document_pending) return false;
+    if (!compact && operationFilter === 'pending' && (lines.length || paired.has(op.id))) return false;
+    return op.day.startsWith(period) && (!project || lines.some(line => line.project === project));
   }).sort((a,b) => b.day.localeCompare(a.day) || b.id-a.id);
   const rows = (compact ? items.slice(0,5) : items).map(op => {
-    const lines = data.allocations.filter(line => line.operation === op.id && (!project || project === line.project));
+    const lines = (byOperation.get(op.id) || []).filter(line => !project || project === line.project);
     const amount = project ? totals(lines).net : op.amount;
-    return `<tr><td>${esc(op.day)}</td><td class="wrap">${esc(op.description)}<small>${esc(bankName(op.account))}</small></td><td>${paired.has(op.id) ? '<span class="pill">Внутренний перевод</span>' : lines.length ? esc([...new Set(lines.map(line => line.project))].join(', ')) : '<span class="pill pending">Без распределения</span>'}</td><td class="${sign(amount)}">${rub(amount)}</td><td>${paired.has(op.id) ? button('Отвязать','unlink-transfer:' + op.id) : button(lines.length ? 'Открыть' : 'Распределить','allocate:' + op.id)} ${!op.account ? button('Указать счёт','assign-account:' + op.id) : ''}</td></tr>`;
+    const hint = [op.suggested_project,op.suggested_article].filter(Boolean).join(' · ');
+    const note = op.document_pending ? 'Ждём документ' : !lines.length && !paired.has(op.id)
+      ? op.bank_hint === 'transfer' ? 'Возможный перевод или депозит'
+      : [op.bank_hint === 'advance' ? 'Возможный аванс' : '',hint ? 'Подсказка: ' + hint : ''].filter(Boolean).join(' · ') : '';
+    return `<tr><td>${esc(op.day)}</td><td class="wrap">${esc(op.description)}<small>${esc([op.counterparty,bankName(op.account)].filter(Boolean).join(' · '))}</small></td>
+      <td>${paired.has(op.id) ? '<span class="pill">Внутренний перевод</span>' : lines.length ? esc([...new Set(lines.map(line => line.project))].join(', ')) : '<span class="pill pending">Без распределения</span>'}${note ? `<small>${esc(note)}</small>` : ''}</td>
+      <td class="${sign(amount)}">${rub(amount)}</td><td>${paired.has(op.id) ? button('Отвязать','unlink-transfer:' + op.id) : button(lines.length ? 'Открыть' : 'Распределить','allocate:' + op.id)} ${!op.account ? button('Указать счёт','assign-account:' + op.id) : ''}</td></tr>`;
   });
   return table(compact ? 'Последние операции' : 'Банковские операции',['Дата','Назначение','Проект','Сумма',''],rows,'Операций за выбранный месяц нет.',compact ? button('Все операции','view:operations') : '');
 }
@@ -171,7 +180,7 @@ function report(basis) {
     return `<tr><td>${esc(article)}</td><td>${rub(plannedAmount)}</td><td>${rub(actualAmount)}</td><td class="${sign(actualAmount-plannedAmount)}">${rub(actualAmount-plannedAmount)}</td></tr>`;
   });
   const extras = cash ? '' : table('Ручные начисления',['Период','Проект','Описание','Сумма'],filterRows(data.accruals.filter(row => inEntity(row.entity))).map(item => `<tr><td>${esc(item.month)}</td><td>${esc(item.project)}</td><td class="wrap">${esc(item.description)}</td><td>${rub(item.amount)}</td></tr>`));
-  return header(cash ? 'БДДС' : 'БДР / P&L',cash ? 'План и факт по датам платежей' : 'План и факт по месяцам начисления',planActions + (cash ? button('Импорт модели «Ро-бот»','robot-import') : button('+ Начисление','accrual'))) + filters(true,false,cash) + versionFilter
+  return header(cash ? 'БДДС' : 'БДР / P&L',cash ? 'План и факт по датам платежей' : 'План и факт по месяцам начисления',planActions + (cash ? '' : button('+ Начисление','accrual'))) + filters(true,false,cash) + versionFilter
     + `<div class="metrics">${card(cash ? 'Чистый денежный поток' : 'Операционный результат',rub(actual.net),`План ${rub(planned.net)}`)}${card(cash ? 'Поступления' : 'Доходы',rub(actual.incoming),`План ${rub(planned.incoming)}`)}${card(cash ? 'Выплаты' : 'Расходы',rub(actual.outgoing),`План ${rub(planned.outgoing)}`)}${cash ? card('Отклонение потока',rub(actual.net-planned.net),'Факт минус план') : card('Маржа проектов',directTotals.incoming ? `${(directTotals.net/directTotals.incoming*100).toFixed(1)}%` : '—',`Офисные расходы · ${rub(office.outgoing)}`)}</div>`
     + table('План-факт по статьям',['Статья','План','Факт','Отклонение'],rows) + (extras ? '<div style="height:15px"></div>' + extras : '');
 }
@@ -308,11 +317,27 @@ function accountReport() {
       <td class="wrap"><span class="pill ${status === 'Сверено' ? '' : 'pending'}">${status}</span>${details}</td>
       <td>${button('Входящий остаток','account-balance:' + item.id)} ${button('Итоги выписки','statement-control:' + item.id)}</td></tr>`;
   });
+  const statements = data.bank_statements.filter(item => inScope(item.account)).sort((a,b) => b.end.localeCompare(a.end));
+  const imports = statements.map(item => {
+    const ops = data.operations.filter(op => op.account === item.account && op.day >= item.start && op.day <= item.end);
+    const check = totals(ops);
+    const start = data.account_balances.find(row => row.account === item.account && row.day <= item.start);
+    const opening = start ? start.amount + totals(data.operations.filter(op =>
+      op.account === item.account && op.day >= start.day && op.day < item.start)).net : null;
+    const status = check.incoming !== item.incoming || check.outgoing !== item.outgoing
+      || (opening !== null && opening !== item.opening) ? 'Есть расхождения'
+      : opening === null ? 'Обороты совпали' : 'Сверено с выпиской';
+    return `<tr><td>${esc(bankName(item.account))}</td><td>${esc(item.start)} — ${esc(item.end)}</td>
+      <td>${rub(item.opening)}</td><td>${rub(item.incoming)}</td><td>${rub(item.outgoing)}</td><td>${rub(item.closing)}</td>
+      <td><span class="pill ${status === 'Есть расхождения' ? 'pending' : ''}">${status}</span></td></tr>`;
+  });
   return header('Банковские счета','Остатки, обороты и сверка с выписками',button('+ Счёт','account',true))
     + `<div class="toolbar"><input type="month" aria-label="Отчётный месяц" id="period" value="${period}">
        <select id="entity" aria-label="Юридическое лицо"><option value="">Все ООО</option>${idOptions(legalOptions(),entity)}</select>
        <select id="bankAccount" aria-label="Банковский счёт"><option value="">Все счета</option>${idOptions(accountOptions(),account)}</select></div>`
-    + table('Сверка за месяц',['Счёт',...Object.values(titles),'Статус',''],rows,'В выбранном разрезе счетов нет.');
+    + table('Сверка за месяц',['Счёт',...Object.values(titles),'Статус',''],rows,'В выбранном разрезе счетов нет.')
+    + (imports.length ? '<div class="calendar-gap"></div>'
+      + table('Загруженные выписки Точки',['Счёт','Период',...Object.values(titles),'Статус'],imports) : '');
 }
 
 function render() {
@@ -321,7 +346,12 @@ function render() {
   nav.innerHTML = '<p class="nav-label">РАЗДЕЛЫ</p>' + tabs.filter(([key]) => finance() || key === 'requests').map(([key,icon,text]) => `<button data-action="view:${key}" class="${view === key ? 'nav-active' : ''}" ${view === key ? 'aria-current="page"' : ''}><span class="nav-icon" aria-hidden="true">${icon}</span>${text}</button>`).join('');
   document.querySelector('#account').innerHTML = `<span class="avatar" aria-hidden="true">${esc(data.user[0])}</span><div>${esc(data.user)}<small>${finance() ? 'Финансист' : 'Сотрудник'}</small></div>`;
   if (view === 'overview') content.innerHTML = overview();
-  if (view === 'operations') content.innerHTML = header('Операции','Банковская выписка и распределение по проектам',button('Связать перевод','transfer') + button('↑ Импорт выписки','import',true)) + filters(false,true) + operationTable();
+  if (view === 'operations') {
+    const count = bankSuggestions().length;
+    const suggestion = count ? button(`Подсказки (${count})`,'bank-suggestions') : '';
+    content.innerHTML = header('Операции','Банковская выписка и распределение по проектам',
+      suggestion + button('Связать перевод','transfer') + button('↑ Импорт выписки','import',true)) + filters(false,true) + operationTable();
+  }
   if (view === 'cash') content.innerHTML = report('БДДС');
   if (view === 'profit') content.innerHTML = report('БДР');
   if (view === 'requests') content.innerHTML = requests();
@@ -371,17 +401,29 @@ function notify(message) {
 
 function allocation(op) {
   const previous = data.allocations.filter(item => item.operation === op.id);
-  const makeRow = (line = {}) => `<div class="split">${picker('Проект','project',data.projects,line.project || project)}${picker('Статья','article',data.articles,line.article || (op.amount < 0 ? 'Разработка' : 'Лицензии'))}${field('Сумма, ₽','amount','number',line.amount == null ? '' : line.amount / 100,'step="0.01" required')}${field('Месяц БДР','accrual','month',line.accrual || '')}<button type="button" class="button remove" aria-label="Удалить строку">×</button></div>`;
-  const form = modal('Распределение операции',`<p class="subtitle">${esc(op.description)} · ${rub(op.amount)} · ${esc(op.day)}</p><small>Пустой месяц БДР оставляет строку только в БДДС. Для уже отражённого ручного начисления оставьте месяц пустым.</small><div id="lines">${(previous.length ? previous : [{amount:op.amount,accrual:op.day.slice(0,7)}]).map(makeRow).join('')}</div><div class="row"><button class="button" type="button" id="add-line">+ Доля проекта</button><strong id="remaining"></strong></div>`, async (_,form) => {
+  const fromBank = op.ref.startsWith('tochka:');
+  const makeRow = (line = {}) => `<div class="split">${picker('Проект','project',fromBank ? ['',...data.projects] : data.projects,line.project ?? '')}${picker('Статья','article',fromBank ? ['',...data.articles] : data.articles,line.article ?? '')}${field('Сумма, ₽','amount','number',line.amount == null ? '' : line.amount / 100,'step="0.01" required')}${field('Месяц БДР','accrual','month',line.accrual || '')}<button type="button" class="button remove" aria-label="Удалить строку">×</button></div>`;
+  const initial = {amount:op.amount,project:op.suggested_project ?? project,
+    article:op.suggested_article ?? (fromBank ? '' : op.amount < 0 ? 'Разработка' : 'Лицензии'),
+    accrual:fromBank || op.document_pending ? '' : op.day.slice(0,7)};
+  const pending = op.document_pending || (op.bank_hint === 'advance' && !previous.length);
+  const checks = `<label class="finance-option"><input type="checkbox" name="documentPending" ${pending ? 'checked' : ''}> Ждём акт или другой документ</label>`
+    + (op.counterparty && op.bank_hint !== 'transfer'
+      ? '<label class="finance-option"><input type="checkbox" name="remember"> Запомнить проект и статью для этого контрагента по этому счёту</label>' : '');
+  const form = modal('Распределение операции',`<p class="subtitle">${esc([op.counterparty,op.description,rub(op.amount),op.day].filter(Boolean).join(' · '))}</p>
+    <small>Пустой месяц БДР оставляет строку только в БДДС. Для уже отражённого ручного начисления оставьте месяц пустым.</small>
+    <div id="lines">${(previous.length ? previous : [initial]).map(makeRow).join('')}</div>
+    <div class="row"><button class="button" type="button" id="add-line">+ Доля проекта</button><strong id="remaining"></strong></div>${checks}`,
+  async (values,form) => {
     const lines = [...form.querySelectorAll('.split')].map(row => Object.fromEntries([...row.querySelectorAll('input,select')].map(input => [input.name,input.value])));
-    await api('allocate',{id:op.id,lines});
+    await api('allocate',{id:op.id,lines,documentPending:values.has('documentPending'),remember:values.has('remember')});
   });
   const remaining = () => {
     const assigned = [...form.querySelectorAll('[name=amount]')].reduce((total,input) => total + Math.round(Number(input.value) * 100),0);
     form.querySelector('#remaining').textContent = 'Осталось ' + rub(op.amount - assigned);
   };
   form.querySelector('#add-line').onclick = () => {
-    form.querySelector('#lines').insertAdjacentHTML('beforeend',makeRow({accrual:op.day.slice(0,7)}));
+    form.querySelector('#lines').insertAdjacentHTML('beforeend',makeRow({accrual:fromBank || form.elements.documentPending.checked ? '' : op.day.slice(0,7)}));
     remaining();
   };
   form.addEventListener('click',event => {
@@ -394,47 +436,98 @@ function allocation(op) {
   remaining();
 }
 
-function workbookImport() {
-  const form = modal('Импорт модели «Ро-бот»',selectField('ООО','entity',legalOptions(),entity)
-    + '<label>Финмодель XLSX<input type="file" name="file" accept=".xlsx" required></label>'
-    + '<label class="finance-option"><input name="includeFinancing" type="checkbox"> Включить возврат вложений и дивиденды</label>'
-    + '<small>Импортируется прогноз БДДС. Проверьте месяц оплаты расходов и сохраните пересчитанную книгу Excel.</small>',
+function showStatementResult(result) {
+  if (result.new || result.imported) period = (result.end || result.month).slice(0,7);
+  view = 'operations';
+  project = '';
+  account = String(result.account);
+  if (result.entity) entity = String(result.entity);
+  operationFilter = 'all';
+  return `Добавлено операций: ${result.new ?? result.imported}. Повторов: ${result.duplicates}.`;
+}
+
+function statementImport() {
+  const sample = 'id;date;description;amount\nex-001;2026-06-26;Оплата лицензии;150000\nex-002;2026-06-27;Услуги дизайнера;-120000\n';
+  const choices = data.accounts.map(item => [item.id,bankName(item.id)]);
+  const newAccounts = legalOptions().map(([id,name]) => ['new:' + id,'Счёт Точки · ' + name + ' (по номеру из файла)']);
+  const form = modal('Импорт банковской выписки',
+    '<p class="subtitle">Загрузите XLSX из Точки напрямую. Для других выписок можно использовать CSV по шаблону.</p>'
+    + selectField('Банковский счёт','account',[...newAccounts,...choices],account || 'new:' + (entity || '1'))
+    + '<label>Файл выписки<input type="file" name="statement" accept=".xlsx,.csv,text/csv" required></label>'
+    + '<div><button class="button" type="button" id="sample">Скачать шаблон CSV</button></div>',
   async values => {
-    const file = values.get('file');
-    if (!file.size || file.size > 1_000_000) throw new Error('Выберите заполненный файл XLSX до 1 МБ.');
+    const file = values.get('statement');
+    const selectedAccount = values.get('account');
+    if (/\.csv$/i.test(file.name)) {
+      if (selectedAccount.startsWith('new:')) throw new Error('Для CSV выберите существующий счёт.');
+      if (file.size > 1_800_000) throw new Error('Выберите CSV до 1,8 МБ.');
+      const csv = await file.text();
+      const result = await api('import',{csv,account:selectedAccount});
+      data = await api('state');
+      return {message:showStatementResult({...result,account:selectedAccount,month:csv.match(/\b\d{4}-\d{2}-\d{2}\b/)?.[0] || period})};
+    }
+    if (!/\.xlsx$/i.test(file.name) || !file.size || file.size > 1_000_000) {
+      throw new Error('Выберите заполненный XLSX Точки до 1 МБ.');
+    }
     const workbook = await new Promise((resolve,reject) => {
       const reader = new FileReader();
       reader.onload = () => resolve(reader.result.split(',')[1]);
       reader.onerror = () => reject(new Error('Не удалось открыть файл.'));
       reader.readAsDataURL(file);
     });
-    const payload = {workbook,entity:values.get('entity'),includeFinancing:values.has('includeFinancing')};
-    return {payload,preview:await api('preview-workbook',payload)};
-  }, ({payload,preview}) => {
-    const grouped = Map.groupBy(preview.months,item => item.scenario);
-    const sections = [...grouped].map(([name,months]) =>
-      `<details><summary>${esc(name)} · ${months.length} мес.</summary><div class="scroll"><table>
-      <thead><tr><th>Месяц</th><th>Поступления</th><th>Работа проекта</th><th>Финансирование и дивиденды</th></tr></thead>
-      <tbody>${months.map(item => `<tr><td>${esc(item.month)}</td><td>${rub(item.incoming)}</td><td>${rub(-item.operating)}</td><td>${rub(-item.financing)}</td></tr>`).join('')}</tbody>
-      </table></div></details>`).join('');
-    const confirmation = modal('Предпросмотр импорта',
-      `<p>${esc(entityName(Number(payload.entity)))} · Ро-бот · БДДС · ${preview.rows} строк плана</p>`
-      + '<small>Повторный импорт заменит строки предыдущей загрузки для этого ООО. Сохранённые версии бюджета остаются в истории.</small>'
-      + (preview.manual ? `<p class="error">В выбранном периоде есть ручные строки плана (${preview.manual}). Они суммируются с импортом.</p>` : '')
-      + sections,
-      async () => {
-        const result = await api('import-workbook',payload);
-        account = '';
-        entity = payload.entity;
-        project = 'Ро-бот';
-        period = result.months[0].month;
-        scenario = 'Базовый';
-        version = '';
-        return `Импортировано строк: ${result.rows}.`;
-      });
-    confirmation.querySelector('[type=submit]').textContent = 'Импортировать в БДДС';
+    const payload = {workbook,account:selectedAccount};
+    return {payload,preview:await api('preview-tochka',payload)};
+  }, ({payload,preview,message}) => {
+    if (message) {
+      render();
+      notify(message);
+      return;
+    }
+    const {accountTail,entity:legal,start,end,opening,incoming,outgoing,closing,other} = preview;
+    const totals = [
+      ['На начало',opening],['Поступления',incoming],['Списания',outgoing],['На конец',closing]
+    ];
+    const confirmation = modal('Предпросмотр выписки Точки',
+      `<p><strong>${esc(entityName(legal))} · счёт ••••${esc(accountTail)}</strong><br>${esc(start)} — ${esc(end)}</p>
+       <p>Новых операций: <strong>${preview.new}</strong> · повторов: ${preview.duplicates}</p>
+       <dl class="statement-totals">${totals.map(([label,value]) => `<div><dt>${label}</dt><dd>${rub(value)}</dd></div>`).join('')}</dl>
+       <small>Суммы операций сходятся с итогами файла. Проекты и статьи можно подтвердить после загрузки.</small>`
+      + (other ? '<p class="error">На выбранном счёте уже есть операции из других источников. При пересечении периодов выберите счёт Точки по номеру из файла или предварительно сверьте записи.</p>' : ''),
+      async () => showStatementResult(await api('import-tochka',payload)));
+    confirmation.querySelector('[type=submit]').textContent = 'Загрузить операции';
   });
-  form.querySelector('[type=submit]').textContent = 'Предпросмотр';
+  form.querySelector('[type=submit]').textContent = 'Продолжить';
+  form.querySelector('#sample').onclick = () => {
+    const link = document.createElement('a');
+    const url = URL.createObjectURL(new Blob(['\ufeff',sample],{type:'text/csv;charset=utf-8'}));
+    link.href = url;
+    link.download = 'qodex-statement.csv';
+    link.click();
+    setTimeout(() => URL.revokeObjectURL(url),1000);
+  };
+}
+
+function bankSuggestions() {
+  const allocated = new Set(data.allocations.map(item => item.operation));
+  const paired = transferMap();
+  return data.operations.filter(op => inScope(op.account) && op.day.startsWith(period)
+    && (!project || project === op.suggested_project) && op.suggested_project && op.suggested_article
+    && !allocated.has(op.id) && !paired.has(op.id));
+}
+
+function confirmSuggestions() {
+  const candidates = bankSuggestions();
+  if (!candidates.length) return notify('В выбранном месяце нет готовых подсказок.');
+  const groups = Map.groupBy(candidates, op => `${op.suggested_project} · ${op.suggested_article}`);
+  const summary = [...groups].map(([label,ops]) =>
+    `<tr><td>${esc(label)}</td><td>${ops.length}</td><td>${rub(totals(ops).net)}</td></tr>`);
+  const form = modal('Подтвердить подсказки',table('Разнесение за месяц',['Проект и статья','Операций','Чистый поток'],summary)
+    + '<small>Операции получат аналитику БДДС. Месяц БДР укажите отдельно по документам.</small>',
+  async () => {
+    const result = await api('apply-bank-suggestions',{ids:candidates.map(op => op.id)});
+    return `Разнесено операций: ${result.applied}.`;
+  });
+  form.querySelector('[type=submit]').textContent = 'Подтвердить разнесение';
 }
 
 function doAction(action) {
@@ -449,7 +542,6 @@ function doAction(action) {
   const amount = (value = '',extra = '') => field('Сумма, ₽','amount','number',value,`step="0.01" required ${extra}`);
   const category = (articles = data.articles) => selectField('ООО','entity',legalOptions(),entity) + `<div class="fields">${picker('Проект','project',data.projects,project)}${picker('Статья','article',articles)}</div>`;
   const save = (title,fields) => modal(title,fields,values => api(kind,{...Object.fromEntries(values),basis:arg,scenario}));
-  if (kind === 'robot-import') workbookImport();
   if (kind === 'allocate') allocation(data.operations.find(op => op.id === Number(arg)));
   if (kind === 'account') save('Новый счёт',selectField('ООО','entity',legalOptions(),entity)
     + field('Название счёта','name','text','','maxlength="80" required'));
@@ -490,32 +582,8 @@ function doAction(action) {
     out.addEventListener('change',update);
     update();
   }
-  if (kind === 'import') {
-    const sample = 'id;date;description;amount\nex-001;2026-06-26;Оплата лицензии;150000\nex-002;2026-06-27;Услуги дизайнера;-120000\n';
-    const form = modal('Импорт выписки',`<p class="subtitle">Выберите CSV в UTF-8. Положительная сумма означает поступление, отрицательная — выплату.</p>${selectField('Банковский счёт','account',accountOptions(),account)}<label>CSV-файл<input type="file" name="statement" accept=".csv,text/csv" required></label><div><button class="button" type="button" id="sample">Скачать шаблон CSV</button></div>`,async (values) => {
-      const file = values.get('statement');
-      if (file.size > 1_800_000) throw new Error('Выберите CSV до 1,8 МБ.');
-      const source = await file.text();
-      const result = await api('import',{csv:source,account:values.get('account')});
-      if (result.imported) {
-        const importedMonth = source.match(/\b\d{4}-\d{2}-\d{2}\b/)?.[0].slice(0,7);
-        if (importedMonth) period = importedMonth;
-      }
-      view = 'operations';
-      project = '';
-      account = values.get('account');
-      operationFilter = 'all';
-      return `Добавлено операций: ${result.imported}. Повторов: ${result.duplicates}.`;
-    });
-    form.querySelector('#sample').onclick = () => {
-      const link = document.createElement('a');
-      const url = URL.createObjectURL(new Blob(['\ufeff',sample],{type:'text/csv;charset=utf-8'}));
-      link.href = url;
-      link.download = 'qodex-statement.csv';
-      link.click();
-      setTimeout(() => URL.revokeObjectURL(url),1000);
-    };
-  }
+  if (kind === 'import') statementImport();
+  if (kind === 'bank-suggestions') confirmSuggestions();
   if (kind === 'balance') {
     const existing = data.balances.find(row => row.project === project);
     modal('Входящий остаток',`<p class="subtitle">${esc(project || 'Вся компания')}. Укажите остаток на начало дня до операций этой даты. Остаток проекта является управленческой оценкой.</p><div class="fields">${field('Дата начала','day','date',existing?.day || defaultDate,'required')}${amount(existing ? existing.amount / 100 : '')}</div>`, values => api(kind,{...Object.fromEntries(values),project}));

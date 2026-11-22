@@ -13,13 +13,13 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import urlsplit
 
-import robot_budget
+import bank_statement
 
 ROOT = Path(__file__).resolve().parent
 DB = Path(os.environ.get("QODEX_DB", ROOT / "data" / "finance.sqlite3"))
 USERS = json.loads(os.environ.get("QODEX_USERS", "{}"))
 PROJECTS = ["Ро-бот", "Проект 2", "Проект 3", "Офис"]
-ARTICLES = ["Лицензии", "Услуги", "Разработка", "Дизайн", "Инфраструктура", "Продажи", "Офисные расходы", "Налоги", "Финансирование", "Дивиденды", "ФОТ", "Поддержка", "Прямые расходы на клиентов"]
+ARTICLES = ["Лицензии", "Услуги", "Разработка", "Дизайн", "Инфраструктура", "Продажи", "Офисные расходы", "Налоги", "Финансирование", "Дивиденды", "ФОТ", "Поддержка", "Прямые расходы на клиентов", "Банковские комиссии"]
 ENTITIES = ["ООО 1", "ООО 2"]
 SCENARIOS = ["Базовый", "Консервативный", "Оптимистичный"]
 
@@ -39,8 +39,8 @@ def init():
           id INTEGER PRIMARY KEY, entity INTEGER NOT NULL CHECK(entity IN (1,2)),
           name TEXT NOT NULL, UNIQUE(entity,name)
         );
-        INSERT OR IGNORE INTO accounts VALUES(1,1,'Основной счёт');
-        INSERT OR IGNORE INTO accounts VALUES(2,2,'Основной счёт');
+        INSERT OR IGNORE INTO accounts(id,entity,name) VALUES(1,1,'Основной счёт');
+        INSERT OR IGNORE INTO accounts(id,entity,name) VALUES(2,2,'Основной счёт');
         CREATE TABLE IF NOT EXISTS account_balances (
           account INTEGER PRIMARY KEY REFERENCES accounts(id), day TEXT NOT NULL, amount INTEGER NOT NULL
         );
@@ -49,6 +49,16 @@ def init():
           opening INTEGER NOT NULL, incoming INTEGER NOT NULL CHECK(incoming>=0),
           outgoing INTEGER NOT NULL CHECK(outgoing>=0), closing INTEGER NOT NULL,
           PRIMARY KEY(account,month)
+        );
+        CREATE TABLE IF NOT EXISTS bank_statements (
+          account INTEGER NOT NULL REFERENCES accounts(id), start TEXT NOT NULL, end TEXT NOT NULL,
+          opening INTEGER NOT NULL, incoming INTEGER NOT NULL, outgoing INTEGER NOT NULL, closing INTEGER NOT NULL,
+          PRIMARY KEY(account,start,end)
+        );
+        CREATE TABLE IF NOT EXISTS bank_rules (
+          account INTEGER NOT NULL REFERENCES accounts(id), party_key TEXT NOT NULL,
+          direction INTEGER NOT NULL, project TEXT NOT NULL, article TEXT NOT NULL,
+          PRIMARY KEY(account,party_key,direction)
         );
         CREATE TABLE IF NOT EXISTS transfers (
           outgoing INTEGER PRIMARY KEY REFERENCES operations(id),
@@ -99,7 +109,11 @@ def init():
         """)
         db.execute("BEGIN IMMEDIATE")
         for table, column, definition in (
+            ("accounts", "bank_key", "TEXT"),
             ("operations", "account", "INTEGER REFERENCES accounts(id)"),
+            ("operations", "counterparty", "TEXT"),
+            ("operations", "party_key", "TEXT"),
+            ("operations", "document_pending", "INTEGER NOT NULL DEFAULT 0"),
             ("plans", "entity", "INTEGER"),
             ("plans", "source", "TEXT"),
             ("accruals", "entity", "INTEGER"),
@@ -108,6 +122,7 @@ def init():
         ):
             if column not in {row["name"] for row in db.execute(f"PRAGMA table_info({table})")}:
                 db.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
+        db.execute("CREATE UNIQUE INDEX IF NOT EXISTS accounts_bank_key ON accounts(bank_key)")
         db.execute("UPDATE operations SET account=CASE WHEN ref IN ('demo-1','demo-2') THEN 2 ELSE 1 END "
                    "WHERE account IS NULL AND ref LIKE 'demo-%'")
         if os.environ.get("QODEX_SEED", "1") == "1" and not db.execute("SELECT 1 FROM operations LIMIT 1").fetchone():
@@ -276,32 +291,105 @@ def freeze_budget(db, payload, actor):
         raise ValueError("Версия с таким названием уже существует для этого месяца и сценария.") from exc
 
 
-def workbook_budget(db, payload, save):
-    entity = entity_id(payload)
+def bank_hash(parts):
+    return hashlib.sha256(json.dumps(parts, ensure_ascii=False).encode()).hexdigest()
+
+
+def find_statement_account(db, choice, statement):
+    key = bank_hash([statement.number])
+    known = db.execute("SELECT id,entity FROM accounts WHERE bank_key=?", (key,)).fetchone()
+    if isinstance(choice, str) and choice.startswith("new:"):
+        entity = entity_id({"entity": choice[4:]})
+        if known and known["entity"] != entity:
+            raise ValueError("Этот счёт Точки уже привязан к другому ООО.")
+        return known["id"] if known else None, entity, key
+    account = account_id(db, choice)
+    registered = db.execute("SELECT entity,bank_key FROM accounts WHERE id=?", (account,)).fetchone()
+    if (known and known["id"] != account) or (registered["bank_key"] and registered["bank_key"] != key):
+        raise ValueError("Выбранный счёт уже связан с другой выпиской. Проверьте ООО и счёт.")
+    return account, registered["entity"], key
+
+
+def operation_hint(op, rule):
+    if not op["ref"].startswith("tochka:"):
+        return None, None, None
+    article, project, flag = bank_statement.hints(op["description"], op["amount"])
+    if rule and flag != "transfer":
+        return rule["article"], rule["project"], flag
+    return article, project, flag
+
+
+def import_tochka(db, payload, save):
     raw = b64decode(payload["workbook"], validate=True)
     if len(raw) > 1_000_000:
-        raise ValueError("Допустимый размер XLSX — до 1 МБ.")
-    include_financing = payload.get("includeFinancing") is True
-    rows = robot_budget.parse_workbook(raw, include_financing)
-    if not rows:
-        raise ValueError("В сценариях нет ни одной ненулевой строки.")
-    preview = {(scenario, period): {"scenario": scenario, "month": period, "incoming": 0, "operating": 0, "financing": 0}
-               for scenario in robot_budget.SCENARIO_SHEETS for period in robot_budget.PERIODS}
-    for period, article, amount, scenario in rows:
-        totals = preview[scenario, period]
-        column = "financing" if article in ("Финансирование", "Дивиденды") else "incoming" if article == "Лицензии" else "operating"
-        totals[column] += amount
-    manual = db.execute("""
-        SELECT COUNT(*) FROM plans WHERE entity=? AND project=? AND basis='БДДС' AND source IS NULL AND month BETWEEN ? AND ?
-    """, (entity, PROJECTS[0], robot_budget.PERIODS[0], robot_budget.PERIODS[-1])).fetchone()[0]
+        raise ValueError("Допустимый размер XLSX — до 1 МБ. Разбейте выгрузку на периоды.")
+    statement = bank_statement.parse(raw, money)
+    account, entity, key = find_statement_account(db, payload["account"], statement)
+    name = f"Точка · ••••{statement.number[-4:]}"
+    existing = {row["ref"] for row in db.execute("SELECT ref FROM operations WHERE account=?", (account,))}
+    rows = []
+    for op in statement.operations:
+        ref = "tochka:" + bank_hash([key, *op.key])
+        if ref not in existing:
+            party_key = bank_hash(op.counterparty_key) if op.counterparty else None
+            rows.append((ref, op.day, op.description, op.amount, op.counterparty, party_key))
+    other = sum(not ref.startswith("tochka:") for ref in existing)
     if save:
-        db.execute("DELETE FROM plans WHERE source=? AND entity=? AND project=? AND basis='БДДС'",
-                   (robot_budget.SOURCE, entity, PROJECTS[0]))
+        if account is None:
+            if db.execute("SELECT 1 FROM accounts WHERE entity=? AND name=?", (entity, name)).fetchone():
+                name += f" · {key[:6]}"
+            account = db.execute("INSERT INTO accounts(entity,name,bank_key) VALUES(?,?,?)",
+                                 (entity, name, key)).lastrowid
+        else:
+            db.execute("UPDATE accounts SET bank_key=? WHERE id=?", (key, account))
         db.executemany("""
-            INSERT INTO plans(month,project,article,amount,basis,scenario,entity,source) VALUES(?,?,?,?,'БДДС',?,?,?)
-        """, [(period, PROJECTS[0], article, amount, scenario, entity, robot_budget.SOURCE)
-              for period, article, amount, scenario in rows])
-    return {"rows":len(rows), "manual":manual, "months":list(preview.values())}
+            INSERT INTO operations(ref,day,description,amount,counterparty,party_key,account) VALUES(?,?,?,?,?,?,?)
+        """, [(*row, account) for row in rows])
+        if not existing:
+            db.execute("INSERT OR IGNORE INTO account_balances VALUES(?,?,?)",
+                       (account, statement.start, statement.opening))
+        db.execute("""
+            INSERT INTO bank_statements VALUES(?,?,?,?,?,?,?)
+            ON CONFLICT(account,start,end) DO UPDATE SET opening=excluded.opening, incoming=excluded.incoming,
+                outgoing=excluded.outgoing, closing=excluded.closing
+        """, (account, statement.start, statement.end, statement.opening,
+              statement.incoming, statement.outgoing, statement.closing))
+    return {"account": account, "entity": entity, "accountTail": statement.number[-4:], "other": other,
+            "start": statement.start, "end": statement.end, "opening": statement.opening,
+            "incoming": statement.incoming, "outgoing": statement.outgoing, "closing": statement.closing,
+            "new": len(rows), "duplicates": len(statement.operations) - len(rows)}
+
+
+def read_operation_rows(db):
+    rules = {(row["account"], row["party_key"], row["direction"]): row for row in db.execute("SELECT * FROM bank_rules")}
+    operations = []
+    for row in db.execute("SELECT * FROM operations"):
+        op = dict(row)
+        rule = rules.get((op["account"], op.pop("party_key"), 1 if op["amount"] > 0 else -1))
+        article, project, flag = operation_hint(op, rule)
+        operations.append({**op, "suggested_article": article, "suggested_project": project, "bank_hint": flag})
+    return operations
+
+
+def apply_bank_suggestions(db, ids):
+    if not isinstance(ids, list) or not ids or len(ids) > 2000:
+        raise ValueError("Выберите до 2 000 операций с подсказками.")
+    by_id = {op["id"]: op for op in read_operation_rows(db)}
+    count = 0
+    for oid in set(int(value) for value in ids):
+        op = by_id.get(oid)
+        if not op or not op["suggested_project"] or not op["suggested_article"] or op["bank_hint"] == "transfer":
+            continue
+        if db.execute("SELECT 1 FROM allocations WHERE operation=?", (oid,)).fetchone() or db.execute(
+            "SELECT 1 FROM transfers WHERE outgoing=? OR incoming=?", (oid, oid)
+        ).fetchone():
+            continue
+        db.execute("INSERT INTO allocations VALUES(?,?,?,?,NULL)",
+                   (oid, op["suggested_project"], op["suggested_article"], op["amount"]))
+        if op["bank_hint"] == "advance":
+            db.execute("UPDATE operations SET document_pending=1 WHERE id=?", (oid,))
+        count += 1
+    return count
 
 
 def mutate(db, action, payload, actor, role):
@@ -309,11 +397,14 @@ def mutate(db, action, payload, actor, role):
         raise PermissionError("Действие доступно финансисту.")
     target = ""
     result = {}
-    if action == "preview-workbook":
-        return workbook_budget(db, payload, save=False)
-    if action == "import-workbook":
-        result = workbook_budget(db, payload, save=True)
-        target = str(payload["entity"])
+    if action == "preview-tochka":
+        return import_tochka(db, payload, save=False)
+    if action == "import-tochka":
+        result = import_tochka(db, payload, save=True)
+        target = f'{result["account"]}:{result["start"]}:{result["end"]}'
+    elif action == "apply-bank-suggestions":
+        result["applied"] = apply_bank_suggestions(db, payload["ids"])
+        target = str(result["applied"])
     elif action == "account":
         name = payload["name"].strip()
         if not name or len(name) > 80:
@@ -371,7 +462,7 @@ def mutate(db, action, payload, actor, role):
         oid = int(payload["id"])
         if db.execute("SELECT 1 FROM transfers WHERE outgoing=? OR incoming=?", (oid, oid)).fetchone():
             raise ValueError("Сначала разорвите связь внутреннего перевода.")
-        op = db.execute("SELECT amount FROM operations WHERE id=?", (oid,)).fetchone()
+        op = db.execute("SELECT amount,account,party_key,document_pending FROM operations WHERE id=?", (oid,)).fetchone()
         if not op:
             raise ValueError("Операция не найдена.")
         rows = [(oid, *dimensions(row), money(row["amount"]), month(row["accrual"]) if row.get("accrual") else None) for row in payload["lines"]]
@@ -383,6 +474,17 @@ def mutate(db, action, payload, actor, role):
         """, (oid,)).fetchone()
         if linked and any(row[1:3] != tuple(linked) for row in rows):
             raise ValueError("Проект и статья операции должны совпадать со связанной заявкой.")
+        pending = payload.get("documentPending", bool(op["document_pending"])) is True
+        if pending and any(row[4] for row in rows):
+            raise ValueError("Пока ждёте акт или другой документ, оставьте месяц БДР пустым.")
+        if payload.get("remember") is True:
+            if not op["party_key"] or len(rows) != 1:
+                raise ValueError("Правило можно сохранить для платежа одного контрагента с одной статьёй и проектом.")
+            db.execute("""
+                INSERT INTO bank_rules VALUES(?,?,?,?,?)
+                ON CONFLICT(account,party_key,direction) DO UPDATE SET project=excluded.project,article=excluded.article
+            """, (op["account"], op["party_key"], 1 if op["amount"] > 0 else -1, rows[0][1], rows[0][2]))
+        db.execute("UPDATE operations SET document_pending=? WHERE id=?", (pending, oid))
         db.execute("DELETE FROM allocations WHERE operation=?", (oid,))
         db.executemany("INSERT INTO allocations VALUES(?,?,?,?,?)", rows)
         target = str(oid)
@@ -497,8 +599,9 @@ class Handler(BaseHTTPRequestHandler):
             with closing(connect()) as db:
                 db.execute("BEGIN")
                 data = {table: [dict(row) for row in db.execute(f"SELECT * FROM {table}")]
-                        for table in ("operations", "allocations", "plans", "accruals", "balances", "accounts", "account_balances", "statement_controls", "transfers", "request_payments", "forecast_entries") if role == "finance"}
+                        for table in ("allocations", "plans", "accruals", "balances", "accounts", "account_balances", "statement_controls", "bank_statements", "transfers", "request_payments", "forecast_entries") if role == "finance"}
                 if role == "finance":
+                    data["operations"] = read_operation_rows(db)
                     data["budget_versions"] = [
                         {**dict(row), "rows": json.loads(row["rows"])}
                         for row in db.execute("SELECT * FROM budget_versions ORDER BY id DESC")
