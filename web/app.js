@@ -381,6 +381,51 @@ function fundsReport() {
     + '<div class="calendar-gap"></div>' + table('Журнал фондов',['Дата','Фонд','Движение','Основание','Сумма'],journal);
 }
 
+function officeDistribution() {
+  const projects = data.projects.filter(name => name !== 'Офис');
+  const form = modal('Распределить расходы офиса',selectField('ООО','entity',legalOptions(),entity)
+    + selectField('База распределения','method',[['revenue','Признанная выручка проектов'],['weights','Доли вручную']])
+    + `<div id="office-weights" hidden><small>Например, введите 60 и 40. Проекты с нулевым весом пропускаются.</small>
+        <div class="fields">${projects.map(name => field(esc(name),'weight','number','','min="0" step="0.01"')).join('')}</div></div>`
+    + `<small>Распределяются начисленные расходы офиса за ${esc(period)} выбранного ООО.</small>`,
+  async values => {
+    const method = values.get('method');
+    const payload = {entity:values.get('entity'),month:period,method,
+      weights:Object.fromEntries(projects.map((name,index) => [name,values.getAll('weight')[index]]))};
+    return {payload,preview:await api('preview-office-distribution',payload)};
+  }, ({payload,preview}) => {
+    const existing = preview.rows.some(row => row.previous);
+    const rows = preview.rows.map(row => `<tr><td>${esc(row.project)}</td>
+      <td>${preview.method === 'revenue' ? rub(row.basis) : row.basis / 100}</td>
+      <td>${rub(row.previous)}</td><td><strong>${rub(row.amount)}</strong></td></tr>`);
+    const approval = modal('Предпросмотр офисных расходов',
+      `<p>${esc(entityName(preview.entity))} · ${esc(preview.month)} · ${rub(preview.expense)}</p>`
+      + table('По проектам',['Проект',preview.method === 'revenue' ? 'Выручка' : 'Вес','Текущий вклад','Новый вклад'],rows)
+      + (existing ? '<label class="finance-option"><input type="checkbox" name="replace" required> Заменить существующие вклады выбранного ООО за этот месяц</label>' : ''),
+    async values => {
+      await api('apply-office-distribution',{...payload,token:preview.token,replace:values.has('replace')});
+      if (entity) entity = payload.entity;
+      return 'Расходы офиса распределены.';
+    });
+    approval.querySelector('[type=submit]').textContent = 'Применить распределение';
+  });
+  const update = () => {
+    form.querySelector('#office-weights').hidden = form.elements.method.value !== 'weights';
+  };
+  const loadRule = () => {
+    const rule = data.officeDistributionRules.find(row => row.entity === Number(form.elements.entity.value) && row.month === period);
+    form.elements.method.value = rule?.method || 'revenue';
+    form.querySelectorAll('[name=weight]').forEach((input,index) => {
+      input.value = rule?.weights[projects[index]] ? rule.weights[projects[index]] / 100 : '';
+    });
+    update();
+  };
+  form.elements.entity.onchange = loadRule;
+  form.elements.method.onchange = update;
+  loadRule();
+  form.querySelector('[type=submit]').textContent = 'Предпросмотр';
+}
+
 function distributionReport() {
   const fact = profitRows().filter(row => row.month === period);
   const byProject = Map.groupBy(fact,row => row.project);
@@ -419,7 +464,7 @@ function distributionReport() {
       <td><span class="pill ${payable && balance ? 'pending' : ''}">${status}</span></td><td>${actions}</td></tr>`;
   });
   return header('Распределение прибыли','Результат по начислениям, вклад в офис и решения по прибыли',
-    button('Вклад в офис','office-contribution') + button('+ Решение','profit-decision',true)) + entityPeriodFilters()
+    button('Вклад в офис','office-contribution') + button('Распределить офис','office-distribution') + button('+ Решение','profit-decision',true)) + entityPeriodFilters()
     + `<div class="metrics">${card('Результат проектов',rub(projectTotal.net),'До вклада в офис')}
       ${card('Расходы офиса',rub(office.outgoing),`Вклад проектов ${rub(officeReceived)}`)}
       ${card('Результат после офиса',rub(result),'По начислениям БДР')}
@@ -785,6 +830,7 @@ function doAction(action) {
       + '<small>Запись меняет резерв. Платежи по-прежнему отражаются в банковских операциях.</small>',
       values => api(kind,{...Object.fromEntries(values),fund:fund.id}));
   }
+  if (kind === 'office-distribution') officeDistribution();
   if (kind === 'office-contribution') {
     const form = modal('Вклад проекта в офис',selectField('ООО','entity',legalOptions(),entity)
       + picker('Проект','project',data.projects.filter(name => name !== 'Офис'),project)

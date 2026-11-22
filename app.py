@@ -164,6 +164,12 @@ def init():
           project TEXT NOT NULL, amount INTEGER NOT NULL CHECK(amount>=0),
           PRIMARY KEY(entity,month,project)
         );
+        CREATE TABLE IF NOT EXISTS office_distribution_rules (
+          entity INTEGER NOT NULL CHECK(entity IN (1,2)), month TEXT NOT NULL,
+          method TEXT NOT NULL CHECK(method IN ('revenue','weights')),
+          weights TEXT NOT NULL, expense INTEGER NOT NULL,
+          PRIMARY KEY(entity,month)
+        );
         CREATE TABLE IF NOT EXISTS forecast_entries (
           id INTEGER PRIMARY KEY, entity INTEGER NOT NULL, day TEXT NOT NULL,
           description TEXT NOT NULL, amount INTEGER NOT NULL
@@ -705,6 +711,71 @@ def link_accrual_schedule(db, schedule, operation):
     return True
 
 
+def distribute_office_costs(db, payload, save):
+    entity, period, method = entity_id(payload), month(payload["month"]), payload["method"]
+    projects = [row["name"] for row in db.execute("SELECT name FROM projects WHERE name<>'Офис' ORDER BY id")]
+    facts = db.execute("""
+        WITH facts(project,amount) AS (
+            SELECT project,amount FROM accruals WHERE entity=? AND month=?
+            UNION ALL
+            SELECT l.project,l.amount FROM allocations l JOIN operations o ON o.id=l.operation
+            JOIN accounts a ON a.id=o.account
+            WHERE a.entity=? AND l.accrual=? AND l.article NOT IN (?,?)
+        )
+        SELECT project, SUM(MAX(amount,0)) AS income, SUM(MAX(-amount,0)) AS expense
+        FROM facts GROUP BY project
+    """, (entity, period, entity, period, *NON_OPERATING)).fetchall()
+    expense = next((row["expense"] for row in facts if row["project"] == "Офис"), 0)
+    if not expense:
+        raise ValueError("За этот месяц у выбранного ООО нет начисленных расходов офиса.")
+    income = {row["project"]: row["income"] for row in facts}
+    weights = {}
+    if method == "weights":
+        values = payload["weights"]
+        if not isinstance(values, dict) or not set(values) <= set(projects):
+            raise ValueError("Проверьте список проектов.")
+        weights = {project: money(values.get(project) or 0, allow_zero=True) for project in projects}
+        if any(weight < 0 for weight in weights.values()):
+            raise ValueError("Вес проекта должен быть неотрицательным.")
+        basis = weights
+    elif method == "revenue":
+        basis = {project: income.get(project, 0) for project in projects}
+    else:
+        raise ValueError("Выберите выручку или ручные веса.")
+    total = sum(basis.values())
+    if not total:
+        raise ValueError("Для распределения нужна выручка проекта или хотя бы один положительный вес.")
+    previous = {row["project"]: row["amount"] for row in db.execute(
+        "SELECT project,amount FROM office_contributions WHERE entity=? AND month=?", (entity, period)
+    )}
+    rows = []
+    remainders = []
+    for project in projects:
+        amount, remainder = divmod(expense * basis[project], total)
+        if basis[project] or previous.get(project):
+            remainders.append(remainder)
+            rows.append({"project": project, "basis": basis[project], "amount": amount, "previous": previous.get(project, 0)})
+    undistributed = expense - sum(row["amount"] for row in rows)
+    for index in sorted(range(len(rows)), key=remainders.__getitem__, reverse=True)[:undistributed]:
+        rows[index]["amount"] += 1
+    result = {"entity": entity, "month": period, "method": method, "expense": expense, "rows": rows}
+    result["token"] = bank_hash(result)
+    if save:
+        if payload.get("token") != result["token"]:
+            raise ValueError("Данные изменились. Откройте новый предпросмотр перед применением.")
+        if any(previous.values()) and payload.get("replace") is not True:
+            raise ValueError("Подтвердите замену существующих вкладов.")
+        db.execute("DELETE FROM office_contributions WHERE entity=? AND month=?", (entity, period))
+        db.executemany("INSERT INTO office_contributions(entity,month,project,amount) VALUES(?,?,?,?)",
+                       [(entity, period, row["project"], row["amount"]) for row in rows if row["amount"]])
+        db.execute("""
+            INSERT INTO office_distribution_rules(entity,month,method,weights,expense) VALUES(?,?,?,?,?)
+            ON CONFLICT(entity,month) DO UPDATE SET method=excluded.method,
+              weights=excluded.weights,expense=excluded.expense
+        """, (entity, period, method, json.dumps(weights, ensure_ascii=False), expense))
+    return result
+
+
 def mutate(db, action, payload, actor, role):
     if role != "finance" and action != "request":
         raise PermissionError("Действие доступно финансисту.")
@@ -787,6 +858,11 @@ def mutate(db, action, payload, actor, role):
             INSERT INTO fund_entries(fund,day,amount,note,actor) VALUES(?,?,?,?,?)
         """, (fund, day(payload["day"]), amount, decision_note(payload["note"]), actor)).lastrowid)
         check_fund_balance(db, fund)
+    elif action == "preview-office-distribution":
+        return distribute_office_costs(db, payload, save=False)
+    elif action == "apply-office-distribution":
+        result = distribute_office_costs(db, payload, save=True)
+        target = f'{result["entity"]}:{result["month"]}'
     elif action == "office-contribution":
         entity, period = entity_id(payload), month(payload["month"])
         project = payload["project"]
@@ -1061,6 +1137,10 @@ class Handler(BaseHTTPRequestHandler):
                     data["client_payers"] = [dict(row) for row in db.execute("SELECT DISTINCT client,payer FROM client_payers")]
                     data["profit_decisions"] = profit_decision_rows(db)
                     data["pnlTemplate"] = pnl_template.read(db)
+                    data["officeDistributionRules"] = [
+                        {**dict(row), "weights": json.loads(row["weights"])}
+                        for row in db.execute("SELECT * FROM office_distribution_rules")
+                    ]
                     data["budget_versions"] = [
                         {**dict(row), "rows": json.loads(row["rows"])}
                         for row in db.execute("SELECT * FROM budget_versions ORDER BY id DESC")
