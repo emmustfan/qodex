@@ -171,7 +171,7 @@ function report(basis) {
     return `<tr><td>${esc(article)}</td><td>${rub(plannedAmount)}</td><td>${rub(actualAmount)}</td><td class="${sign(actualAmount-plannedAmount)}">${rub(actualAmount-plannedAmount)}</td></tr>`;
   });
   const extras = cash ? '' : table('Ручные начисления',['Период','Проект','Описание','Сумма'],filterRows(data.accruals.filter(row => inEntity(row.entity))).map(item => `<tr><td>${esc(item.month)}</td><td>${esc(item.project)}</td><td class="wrap">${esc(item.description)}</td><td>${rub(item.amount)}</td></tr>`));
-  return header(cash ? 'БДДС' : 'БДР / P&L',cash ? 'План и факт по датам платежей' : 'План и факт по месяцам начисления',planActions + (cash ? '' : button('+ Начисление','accrual'))) + filters(true,false,cash) + versionFilter
+  return header(cash ? 'БДДС' : 'БДР / P&L',cash ? 'План и факт по датам платежей' : 'План и факт по месяцам начисления',planActions + (cash ? button('Импорт модели «Ро-бот»','robot-import') : button('+ Начисление','accrual'))) + filters(true,false,cash) + versionFilter
     + `<div class="metrics">${card(cash ? 'Чистый денежный поток' : 'Операционный результат',rub(actual.net),`План ${rub(planned.net)}`)}${card(cash ? 'Поступления' : 'Доходы',rub(actual.incoming),`План ${rub(planned.incoming)}`)}${card(cash ? 'Выплаты' : 'Расходы',rub(actual.outgoing),`План ${rub(planned.outgoing)}`)}${cash ? card('Отклонение потока',rub(actual.net-planned.net),'Факт минус план') : card('Маржа проектов',directTotals.incoming ? `${(directTotals.net/directTotals.incoming*100).toFixed(1)}%` : '—',`Офисные расходы · ${rub(office.outgoing)}`)}</div>`
     + table('План-факт по статьям',['Статья','План','Факт','Отклонение'],rows) + (extras ? '<div style="height:15px"></div>' + extras : '');
 }
@@ -333,7 +333,7 @@ function render() {
 const field = (label, name, type, value = '', extra = '') => `<label>${label}<input name="${name}" type="${type}" value="${esc(value)}" ${extra}></label>`;
 const picker = (label, name, items, value) => `<label>${label}<select name="${name}">${options(items,value)}</select></label>`;
 
-function modal(title, fields, handler) {
+function modal(title, fields, handler, onSuccess = null) {
   dialog.innerHTML = `<form><div class="row"><h2>${title}</h2><button class="button" type="button" data-close aria-label="Закрыть">×</button></div>${fields}<div class="error" role="alert"></div><div><button class="button primary" type="submit">Сохранить</button></div></form>`;
   const form = dialog.querySelector('form');
   form.querySelector('[data-close]').onclick = () => dialog.close();
@@ -343,10 +343,15 @@ function modal(title, fields, handler) {
     submit.disabled = true;
     try {
       const note = await handler(new FormData(form),form,event.submitter);
-      data = await api('state');
-      dialog.close();
-      render();
-      notify(note || 'Изменения сохранены.');
+      if (onSuccess) {
+        dialog.close();
+        onSuccess(note);
+      } else {
+        data = await api('state');
+        dialog.close();
+        render();
+        notify(typeof note === 'string' ? note : 'Изменения сохранены.');
+      }
     } catch (error) {
       form.querySelector('.error').textContent = error.message;
     } finally {
@@ -389,6 +394,49 @@ function allocation(op) {
   remaining();
 }
 
+function workbookImport() {
+  const form = modal('Импорт модели «Ро-бот»',selectField('ООО','entity',legalOptions(),entity)
+    + '<label>Финмодель XLSX<input type="file" name="file" accept=".xlsx" required></label>'
+    + '<label class="finance-option"><input name="includeFinancing" type="checkbox"> Включить возврат вложений и дивиденды</label>'
+    + '<small>Импортируется прогноз БДДС. Проверьте месяц оплаты расходов и сохраните пересчитанную книгу Excel.</small>',
+  async values => {
+    const file = values.get('file');
+    if (!file.size || file.size > 1_000_000) throw new Error('Выберите заполненный файл XLSX до 1 МБ.');
+    const workbook = await new Promise((resolve,reject) => {
+      const reader = new FileReader();
+      reader.onload = () => resolve(reader.result.split(',')[1]);
+      reader.onerror = () => reject(new Error('Не удалось открыть файл.'));
+      reader.readAsDataURL(file);
+    });
+    const payload = {workbook,entity:values.get('entity'),includeFinancing:values.has('includeFinancing')};
+    return {payload,preview:await api('preview-workbook',payload)};
+  }, ({payload,preview}) => {
+    const grouped = Map.groupBy(preview.months,item => item.scenario);
+    const sections = [...grouped].map(([name,months]) =>
+      `<details><summary>${esc(name)} · ${months.length} мес.</summary><div class="scroll"><table>
+      <thead><tr><th>Месяц</th><th>Поступления</th><th>Работа проекта</th><th>Финансирование и дивиденды</th></tr></thead>
+      <tbody>${months.map(item => `<tr><td>${esc(item.month)}</td><td>${rub(item.incoming)}</td><td>${rub(-item.operating)}</td><td>${rub(-item.financing)}</td></tr>`).join('')}</tbody>
+      </table></div></details>`).join('');
+    const confirmation = modal('Предпросмотр импорта',
+      `<p>${esc(entityName(Number(payload.entity)))} · Ро-бот · БДДС · ${preview.rows} строк плана</p>`
+      + '<small>Повторный импорт заменит строки предыдущей загрузки для этого ООО. Сохранённые версии бюджета остаются в истории.</small>'
+      + (preview.manual ? `<p class="error">В выбранном периоде есть ручные строки плана (${preview.manual}). Они суммируются с импортом.</p>` : '')
+      + sections,
+      async () => {
+        const result = await api('import-workbook',payload);
+        account = '';
+        entity = payload.entity;
+        project = 'Ро-бот';
+        period = result.months[0].month;
+        scenario = 'Базовый';
+        version = '';
+        return `Импортировано строк: ${result.rows}.`;
+      });
+    confirmation.querySelector('[type=submit]').textContent = 'Импортировать в БДДС';
+  });
+  form.querySelector('[type=submit]').textContent = 'Предпросмотр';
+}
+
 function doAction(action) {
   const [kind,arg] = action.split(':');
   if (kind === 'view') {
@@ -401,6 +449,7 @@ function doAction(action) {
   const amount = (value = '',extra = '') => field('Сумма, ₽','amount','number',value,`step="0.01" required ${extra}`);
   const category = (articles = data.articles) => selectField('ООО','entity',legalOptions(),entity) + `<div class="fields">${picker('Проект','project',data.projects,project)}${picker('Статья','article',articles)}</div>`;
   const save = (title,fields) => modal(title,fields,values => api(kind,{...Object.fromEntries(values),basis:arg,scenario}));
+  if (kind === 'robot-import') workbookImport();
   if (kind === 'allocate') allocation(data.operations.find(op => op.id === Number(arg)));
   if (kind === 'account') save('Новый счёт',selectField('ООО','entity',legalOptions(),entity)
     + field('Название счёта','name','text','','maxlength="80" required'));

@@ -6,3 +6,6 @@
 .payment-list{margin:0;padding-left:20px}
 .payment-list li{margin-bottom:8px}
 .payment-list .button{margin-left:6px}
+dialog label.finance-option{display:flex;align-items:center}
+dialog summary{cursor:pointer;font-weight:600}
+dialog details table{margin-top:8px}

@@ -13,11 +13,13 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import urlsplit
 
+import robot_budget
+
 ROOT = Path(__file__).resolve().parent
 DB = Path(os.environ.get("QODEX_DB", ROOT / "data" / "finance.sqlite3"))
 USERS = json.loads(os.environ.get("QODEX_USERS", "{}"))
 PROJECTS = ["Ро-бот", "Проект 2", "Проект 3", "Офис"]
-ARTICLES = ["Лицензии", "Услуги", "Разработка", "Дизайн", "Инфраструктура", "Продажи", "Офисные расходы", "Налоги", "Финансирование", "Дивиденды"]
+ARTICLES = ["Лицензии", "Услуги", "Разработка", "Дизайн", "Инфраструктура", "Продажи", "Офисные расходы", "Налоги", "Финансирование", "Дивиденды", "ФОТ", "Поддержка", "Прямые расходы на клиентов"]
 ENTITIES = ["ООО 1", "ООО 2"]
 SCENARIOS = ["Базовый", "Консервативный", "Оптимистичный"]
 
@@ -99,6 +101,7 @@ def init():
         for table, column, definition in (
             ("operations", "account", "INTEGER REFERENCES accounts(id)"),
             ("plans", "entity", "INTEGER"),
+            ("plans", "source", "TEXT"),
             ("accruals", "entity", "INTEGER"),
             ("requests", "entity", "INTEGER"),
             ("requests", "payment_day", "TEXT"),
@@ -273,12 +276,45 @@ def freeze_budget(db, payload, actor):
         raise ValueError("Версия с таким названием уже существует для этого месяца и сценария.") from exc
 
 
+def workbook_budget(db, payload, save):
+    entity = entity_id(payload)
+    raw = b64decode(payload["workbook"], validate=True)
+    if len(raw) > 1_000_000:
+        raise ValueError("Допустимый размер XLSX — до 1 МБ.")
+    include_financing = payload.get("includeFinancing") is True
+    rows = robot_budget.parse_workbook(raw, include_financing)
+    if not rows:
+        raise ValueError("В сценариях нет ни одной ненулевой строки.")
+    preview = {(scenario, period): {"scenario": scenario, "month": period, "incoming": 0, "operating": 0, "financing": 0}
+               for scenario in robot_budget.SCENARIO_SHEETS for period in robot_budget.PERIODS}
+    for period, article, amount, scenario in rows:
+        totals = preview[scenario, period]
+        column = "financing" if article in ("Финансирование", "Дивиденды") else "incoming" if article == "Лицензии" else "operating"
+        totals[column] += amount
+    manual = db.execute("""
+        SELECT COUNT(*) FROM plans WHERE entity=? AND project=? AND basis='БДДС' AND source IS NULL AND month BETWEEN ? AND ?
+    """, (entity, PROJECTS[0], robot_budget.PERIODS[0], robot_budget.PERIODS[-1])).fetchone()[0]
+    if save:
+        db.execute("DELETE FROM plans WHERE source=? AND entity=? AND project=? AND basis='БДДС'",
+                   (robot_budget.SOURCE, entity, PROJECTS[0]))
+        db.executemany("""
+            INSERT INTO plans(month,project,article,amount,basis,scenario,entity,source) VALUES(?,?,?,?,'БДДС',?,?,?)
+        """, [(period, PROJECTS[0], article, amount, scenario, entity, robot_budget.SOURCE)
+              for period, article, amount, scenario in rows])
+    return {"rows":len(rows), "manual":manual, "months":list(preview.values())}
+
+
 def mutate(db, action, payload, actor, role):
     if role != "finance" and action != "request":
         raise PermissionError("Действие доступно финансисту.")
     target = ""
     result = {}
-    if action == "account":
+    if action == "preview-workbook":
+        return workbook_budget(db, payload, save=False)
+    if action == "import-workbook":
+        result = workbook_budget(db, payload, save=True)
+        target = str(payload["entity"])
+    elif action == "account":
         name = payload["name"].strip()
         if not name or len(name) > 80:
             raise ValueError("Укажите название счёта до 80 символов.")
