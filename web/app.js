@@ -72,8 +72,14 @@ function cashRows(includeTransfers = false) {
 
 function profitRows() {
   const byId = new Map(data.operations.map(op => [op.id,op]));
-  const matched = data.allocations.filter(row => row.accrual && !nonOperating.includes(row.article) && inEntity(bank(byId.get(row.operation)?.account)?.entity));
-  return [...matched.map(row => ({...row,month:row.accrual,article:row.accrual_article || row.article})), ...data.accruals.filter(row => inEntity(row.entity))];
+  const matched = data.allocations.flatMap(row => {
+    const op = byId.get(row.operation);
+    const legal = bank(op?.account)?.entity;
+    if (!row.accrual || nonOperating.includes(row.article) || !inEntity(legal)) return [];
+    return [{...row,entity:legal,description:op.description,day:op.day,
+      month:row.accrual,article:row.accrual_article || row.article}];
+  });
+  return [...matched, ...data.accruals.filter(row => inEntity(row.entity))];
 }
 
 function totals(rows) {
@@ -191,9 +197,11 @@ function report(basis) {
   if (saved) budget = filterRows(saved.rows.filter(row => inEntity(row.entity)));
   const versionFilter = `<div class="toolbar"><select id="version" aria-label="Версия плана"><option value="">Текущий план</option>${idOptions(versions.map(item => [item.id,item.name]),version)}</select></div>`;
   const planActions = saved ? '' : button('+ Строка плана','plan:' + basis,true) + button('Зафиксировать план','freeze-budget:' + basis);
+  const structure = cash ? null : structuredPnl(budget,fact);
+  const display = cash || pnlMode === 'articles' ? 'articles' : 'structure';
+  const switchView = cash ? '' : button(display === 'structure' ? 'По статьям' : 'Структура P&L',
+    'pnl-mode:' + (display === 'structure' ? 'articles' : 'structure')) + button('Настроить шаблон','pnl-edit');
   const actual = totals(fact), planned = totals(budget);
-  const direct = fact.filter(row => row.project !== 'Офис');
-  const directTotals = totals(direct);
   const office = totals(fact.filter(row => row.project === 'Офис'));
   const trans = new Set([...budget,...fact].map(row => row.article));
   const rows = [...trans].map(article => {
@@ -202,9 +210,10 @@ function report(basis) {
     return `<tr><td>${esc(article)}</td><td>${rub(plannedAmount)}</td><td>${rub(actualAmount)}</td><td class="${sign(actualAmount-plannedAmount)}">${rub(actualAmount-plannedAmount)}</td></tr>`;
   });
   const extras = cash ? '' : table('Ручные начисления',['Период','Проект','Описание','Сумма'],filterRows(data.accruals.filter(row => inEntity(row.entity))).map(item => `<tr><td>${esc(item.month)}</td><td>${esc(item.project)}</td><td class="wrap">${esc(item.description)}</td><td>${rub(item.amount)}</td></tr>`));
-  return header(cash ? 'БДДС' : 'БДР / P&L',cash ? 'План и факт по датам платежей' : 'План и факт по месяцам начисления',planActions + (cash ? '' : button('+ Начисление','accrual') + button('Распределение прибыли','view:distribution'))) + filters(true,false,cash) + versionFilter
-    + `<div class="metrics">${card(cash ? 'Чистый денежный поток' : 'Операционный результат',rub(actual.net),`План ${rub(planned.net)}`)}${card(cash ? 'Поступления' : 'Доходы',rub(actual.incoming),`План ${rub(planned.incoming)}`)}${card(cash ? 'Выплаты' : 'Расходы',rub(actual.outgoing),`План ${rub(planned.outgoing)}`)}${cash ? card('Отклонение потока',rub(actual.net-planned.net),'Факт минус план') : card('Маржа проектов',directTotals.incoming ? `${(directTotals.net/directTotals.incoming*100).toFixed(1)}%` : '—',`Офисные расходы · ${rub(office.outgoing)}`)}</div>`
-    + table('План-факт по статьям',['Статья','План','Факт','Отклонение'],rows) + (extras ? '<div style="height:15px"></div>' + extras : '');
+  return header(cash ? 'БДДС' : 'БДР / P&L',cash ? 'План и факт по датам платежей' : 'План и факт по месяцам начисления',planActions + (cash ? '' : button('+ Начисление','accrual') + button('Распределение прибыли','view:distribution') + switchView)) + filters(true,false,cash) + versionFilter
+    + `<div class="metrics">${card(cash ? 'Чистый денежный поток' : 'Операционный результат',rub(actual.net),`План ${rub(planned.net)}`)}${card(cash ? 'Поступления' : 'Доходы',rub(actual.incoming),`План ${rub(planned.incoming)}`)}${card(cash ? 'Выплаты' : 'Расходы',rub(actual.outgoing),`План ${rub(planned.outgoing)}`)}${cash ? card('Отклонение потока',rub(actual.net-planned.net),'Факт минус план') : card('Маржа проектов',pnlPercent(structure.margin),`Офисные расходы · ${rub(office.outgoing)}`)}</div>`
+    + (display === 'structure' ? structure.html : table('План-факт по статьям',['Статья','План','Факт','Отклонение'],rows))
+    + (extras ? '<div class="calendar-gap"></div>' + extras : '');
 }
 
 const dueDate = item => item.payment_day || item.day;
@@ -486,8 +495,8 @@ function directories() {
 
 function render() {
   if (!finance()) view = 'requests';
-  if (view === 'profit' || view === 'calendar') account = '';
-  nav.innerHTML = '<p class="nav-label">РАЗДЕЛЫ</p>' + tabs.filter(([key]) => finance() || key === 'requests').map(([key,icon,text]) => `<button data-action="view:${key}" class="${view === key ? 'nav-active' : ''}" ${view === key ? 'aria-current="page"' : ''}><span class="nav-icon" aria-hidden="true">${icon}</span>${text}</button>`).join('');
+  if (view === 'profit' || view === 'pnl-template' || view === 'calendar') account = '';
+  nav.innerHTML = '<p class="nav-label">РАЗДЕЛЫ</p>' + tabs.filter(([key]) => finance() || key === 'requests').map(([key,icon,text]) => `<button data-action="view:${key}" class="${view === key || (key === 'profit' && view === 'pnl-template') ? 'nav-active' : ''}" ${view === key || (key === 'profit' && view === 'pnl-template') ? 'aria-current="page"' : ''}><span class="nav-icon" aria-hidden="true">${icon}</span>${text}</button>`).join('');
   document.querySelector('#account').innerHTML = `<span class="avatar" aria-hidden="true">${esc(data.user[0])}</span><div>${esc(data.user)}<small>${finance() ? 'Финансист' : 'Сотрудник'}</small></div>`;
   if (view === 'overview') content.innerHTML = overview();
   if (view === 'operations') {
@@ -498,6 +507,7 @@ function render() {
   }
   if (view === 'cash') content.innerHTML = report('БДДС');
   if (view === 'profit') content.innerHTML = report('БДР');
+  if (view === 'pnl-template') content.innerHTML = pnlEditor();
   if (view === 'requests') content.innerHTML = requests();
   if (view === 'calendar') content.innerHTML = calendar();
   if (view === 'forecast') content.innerHTML = forecast();
@@ -744,6 +754,7 @@ function budgetEntry(kind,basis) {
 
 function doAction(action) {
   const [kind,arg] = action.split(':');
+  if (handlePnlAction(kind,arg)) return;
   if (kind === 'view') {
     view = arg;
     version = '';

@@ -14,6 +14,7 @@ from pathlib import Path
 from urllib.parse import urlsplit
 
 import bank_statement
+import pnl_template
 
 ROOT = Path(__file__).resolve().parent
 DB = Path(os.environ.get("QODEX_DB", ROOT / "data" / "finance.sqlite3"))
@@ -30,6 +31,10 @@ DEFAULT_ARTICLES = {
 }
 ENTITIES = ["ООО 1", "ООО 2"]
 SCENARIOS = ["Базовый", "Консервативный", "Оптимистичный"]
+
+
+def pnl_articles(directions):
+    return {name: direction for name, direction in directions.items() if name not in (*NON_OPERATING, *CASH_STAGES)}
 
 
 def connect():
@@ -49,6 +54,9 @@ def init():
         CREATE TABLE IF NOT EXISTS articles (
           id INTEGER PRIMARY KEY, name TEXT NOT NULL UNIQUE,
           direction TEXT NOT NULL CHECK(direction IN ('income','expense','both'))
+        );
+        CREATE TABLE IF NOT EXISTS pnl_template (
+          id INTEGER PRIMARY KEY CHECK(id=1), revision INTEGER NOT NULL, body TEXT NOT NULL
         );
         CREATE TABLE IF NOT EXISTS clients (
           id INTEGER PRIMARY KEY, name TEXT NOT NULL UNIQUE
@@ -175,6 +183,7 @@ def init():
                 db.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
         db.executemany("INSERT OR IGNORE INTO projects(name) VALUES(?)", [(name,) for name in SEED_PROJECTS])
         db.executemany("INSERT OR IGNORE INTO articles(name,direction) VALUES(?,?)", DEFAULT_ARTICLES.items())
+        pnl_template.initialize(db, pnl_articles(DEFAULT_ARTICLES))
         db.execute("CREATE UNIQUE INDEX IF NOT EXISTS accounts_bank_key ON accounts(bank_key)")
         db.execute("UPDATE operations SET account=CASE WHEN ref IN ('demo-1','demo-2') THEN 2 ELSE 1 END "
                    "WHERE account IS NULL AND ref LIKE 'demo-%'")
@@ -616,6 +625,10 @@ def mutate(db, action, payload, actor, role):
     elif action == "apply-bank-suggestions":
         result["applied"] = apply_bank_suggestions(db, payload["ids"])
         target = str(result["applied"])
+    elif action == "pnl-template":
+        directions = {row["name"]: row["direction"] for row in db.execute("SELECT name,direction FROM articles")}
+        result["revision"] = pnl_template.save(db, payload, pnl_articles(directions))
+        target = str(result["revision"])
     elif action == "project":
         name = directory_name(db, "projects", payload["name"])
         target = str(db.execute("INSERT INTO projects(name) VALUES(?)", (name,)).lastrowid)
@@ -914,6 +927,7 @@ class Handler(BaseHTTPRequestHandler):
                     data["operations"] = read_operation_rows(db)
                     data["client_payers"] = [dict(row) for row in db.execute("SELECT DISTINCT client,payer FROM client_payers")]
                     data["profit_decisions"] = profit_decision_rows(db)
+                    data["pnlTemplate"] = pnl_template.read(db)
                     data["budget_versions"] = [
                         {**dict(row), "rows": json.loads(row["rows"])}
                         for row in db.execute("SELECT * FROM budget_versions ORDER BY id DESC")
@@ -924,7 +938,7 @@ class Handler(BaseHTTPRequestHandler):
                 data.update(entities=ENTITIES, projects=projects, articles=list(directions), articleDirections=directions, cashStages=CASH_STAGES,
                             scenarios=SCENARIOS, user=name, role=role, demo=not USERS)
                 return self.reply(200, data)
-        assets = {"/": ("index.html", "text/html"), "/style.css": ("style.css", "text/css"), "/app.js": ("app.js", "text/javascript")}
+        assets = {"/": ("index.html", "text/html"), "/style.css": ("style.css", "text/css"), "/app.js": ("app.js", "text/javascript"), "/pnl.js": ("pnl.js", "text/javascript")}
         if path in assets:
             filename, mime = assets[path]
             return self.send_data(200, (ROOT / "web" / filename).read_bytes(), mime + "; charset=utf-8")
