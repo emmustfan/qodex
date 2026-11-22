@@ -3,7 +3,7 @@ const dialog = document.querySelector('#dialog');
 const nav = document.querySelector('#nav');
 const RUB = new Intl.NumberFormat('ru-RU', {style:'currency',currency:'RUB',maximumFractionDigits:2,minimumFractionDigits:0});
 const MONTHS = ['янв','фев','мар','апр','май','июн','июл','авг','сен','окт','ноя','дек'];
-const tabs = [['overview','▦','Обзор'],['operations','⇄','Операции'],['cash','▤','БДДС'],['calendar','▧','Платёжный календарь'],['forecast','↗','Прогноз денег'],['profit','▥','БДР / P&L'],['distribution','∑','Распределение прибыли'],['funds','◈','Фонды'],['requests','✓','Заявки'],['accounts','▱','Счета'],['directories','▤','Справочники']];
+const tabs = [['overview','▦','Обзор'],['operations','⇄','Операции'],['cash','▤','БДДС'],['calendar','▧','Платёжный календарь'],['forecast','↗','Прогноз денег'],['profit','▥','БДР / P&L'],['schedules','▦','Графики начислений'],['distribution','∑','Распределение прибыли'],['funds','◈','Фонды'],['requests','✓','Заявки'],['accounts','▱','Счета'],['directories','▤','Справочники']];
 const nonOperating = ['Финансирование','Дивиденды'];
 let data;
 let view = 'overview';
@@ -145,12 +145,13 @@ function operationTable(compact = false) {
     const payer = op.counterparty || op.payer_label;
     const client = clientName(op.client);
     const hintedClient = !client ? clientName(op.suggested_client) : '';
+    const schedule = scheduleForOperation(op.id);
     const clientLabel = client ? 'Клиент: ' + client : hintedClient ? 'Подсказка: ' + hintedClient : '';
     const action = dividend ? button('Выплаты','profit-payments:' + dividend) : paired.has(op.id) ? button('Отвязать','unlink-transfer:' + op.id)
       : button(lines.length ? 'Открыть' : 'Распределить','allocate:' + op.id);
     return `<tr><td>${esc(op.day)}</td><td class="wrap">${esc(op.description)}<small>${esc([payer,bankName(op.account)].filter(Boolean).join(' · '))}</small>${clientLabel ? `<small>${esc(clientLabel)}</small>` : ''}</td>
       <td>${category}${articles && !dividend ? `<small>${esc(articles)}</small>` : ''}${note ? `<small>${esc(note)}</small>` : ''}</td>
-      <td class="${sign(amount)}">${rub(amount)}</td><td>${action} ${!op.account ? button('Указать счёт','assign-account:' + op.id) : ''}</td></tr>`;
+      <td class="${sign(amount)}">${rub(amount)}</td><td>${action} ${schedule ? button('Оплаты по графику','schedule-payments:' + schedule) : ''} ${!op.account ? button('Указать счёт','assign-account:' + op.id) : ''}</td></tr>`;
   });
   return table(compact ? 'Последние операции' : 'Банковские операции',['Дата','Назначение, плательщик и клиент','Проект и статья','Сумма',''],rows,'Операций за выбранный месяц нет.',compact ? button('Все операции','view:operations') : '');
 }
@@ -209,8 +210,8 @@ function report(basis) {
     const plannedAmount = totals(budget.filter(row => row.article === article)).net;
     return `<tr><td>${esc(article)}</td><td>${rub(plannedAmount)}</td><td>${rub(actualAmount)}</td><td class="${sign(actualAmount-plannedAmount)}">${rub(actualAmount-plannedAmount)}</td></tr>`;
   });
-  const extras = cash ? '' : table('Ручные начисления',['Период','Проект','Описание','Сумма'],filterRows(data.accruals.filter(row => inEntity(row.entity))).map(item => `<tr><td>${esc(item.month)}</td><td>${esc(item.project)}</td><td class="wrap">${esc(item.description)}</td><td>${rub(item.amount)}</td></tr>`));
-  return header(cash ? 'БДДС' : 'БДР / P&L',cash ? 'План и факт по датам платежей' : 'План и факт по месяцам начисления',planActions + (cash ? '' : button('+ Начисление','accrual') + button('Распределение прибыли','view:distribution') + switchView)) + filters(true,false,cash) + versionFilter
+  const extras = cash ? '' : table('Подтверждённые начисления',['Период','Проект','Описание','Сумма'],filterRows(data.accruals.filter(row => inEntity(row.entity))).map(item => `<tr><td>${esc(item.month)}</td><td>${esc(item.project)}</td><td class="wrap">${esc(item.description)}</td><td>${rub(item.amount)}</td></tr>`));
+  return header(cash ? 'БДДС' : 'БДР / P&L',cash ? 'План и факт по датам платежей' : 'План и факт по месяцам начисления',planActions + (cash ? '' : button('+ Начисление','accrual') + button('Распределение прибыли','view:distribution') + button('Графики начислений','view:schedules') + switchView)) + filters(true,false,cash) + versionFilter
     + `<div class="metrics">${card(cash ? 'Чистый денежный поток' : 'Операционный результат',rub(actual.net),`План ${rub(planned.net)}`)}${card(cash ? 'Поступления' : 'Доходы',rub(actual.incoming),`План ${rub(planned.incoming)}`)}${card(cash ? 'Выплаты' : 'Расходы',rub(actual.outgoing),`План ${rub(planned.outgoing)}`)}${cash ? card('Отклонение потока',rub(actual.net-planned.net),'Факт минус план') : card('Маржа проектов',pnlPercent(structure.margin),`Офисные расходы · ${rub(office.outgoing)}`)}</div>`
     + (display === 'structure' ? structure.html : table('План-факт по статьям',['Статья','План','Факт','Отклонение'],rows))
     + (extras ? '<div class="calendar-gap"></div>' + extras : '');
@@ -508,6 +509,7 @@ function render() {
   if (view === 'cash') content.innerHTML = report('БДДС');
   if (view === 'profit') content.innerHTML = report('БДР');
   if (view === 'pnl-template') content.innerHTML = pnlEditor();
+  if (view === 'schedules') content.innerHTML = scheduleReport();
   if (view === 'requests') content.innerHTML = requests();
   if (view === 'calendar') content.innerHTML = calendar();
   if (view === 'forecast') content.innerHTML = forecast();
@@ -557,6 +559,7 @@ function notify(message) {
 }
 
 function allocation(op) {
+  const schedule = scheduleForOperation(op.id);
   const previous = data.allocations.filter(item => item.operation === op.id);
   const fromBank = op.ref.startsWith('tochka:');
   const incoming = op.amount > 0;
@@ -587,7 +590,7 @@ function allocation(op) {
     </div><div id="new-client" hidden>${field('Название клиента','newClient','text','','maxlength="100"')}</div>`
     + (op.has_bank_payer ? '<label class="finance-option"><input type="checkbox" name="rememberClient"> Подсказывать этого клиента для будущих платежей данного плательщика</label>' : '')
     : '';
-  const help = incoming
+  const help = schedule ? 'Оплата связана с графиком. Начисление подтверждается в графике.' : incoming
     ? 'Месяц БДР укажите, когда выручка заработана. Для этапов оплаты статья БДР по умолчанию — «Выручка по проекту».'
     : 'Пустой месяц БДР оставляет строку только в БДДС. Для уже отражённого ручного начисления оставьте месяц пустым.';
   const form = modal(incoming ? 'Распределение поступления' : 'Распределение операции',
@@ -604,6 +607,7 @@ function allocation(op) {
     await api('allocate',{id:op.id,lines,documentPending:values.has('documentPending'),remember:values.has('remember'),...extra});
   });
   const update = () => {
+    if (schedule) form.querySelectorAll('[name=accrual]').forEach(input => {input.disabled = true;});
     const assigned = [...form.querySelectorAll('[name=amount]')].reduce((total,input) => total + Math.round(Number(input.value) * 100),0);
     form.querySelector('#remaining').textContent = 'Осталось ' + rub(op.amount - assigned);
     if (incoming) {
@@ -620,7 +624,7 @@ function allocation(op) {
   };
   form.querySelector('#add-line').onclick = () => {
     form.querySelector('#lines').insertAdjacentHTML('beforeend',makeRow({
-      accrual:fromBank || incoming || form.elements.documentPending.checked ? '' : op.day.slice(0,7)
+      accrual:schedule || fromBank || incoming || form.elements.documentPending.checked ? '' : op.day.slice(0,7)
     }));
     update();
   };
@@ -754,7 +758,7 @@ function budgetEntry(kind,basis) {
 
 function doAction(action) {
   const [kind,arg] = action.split(':');
-  if (handlePnlAction(kind,arg)) return;
+  if (handlePnlAction(kind,arg) || handleScheduleAction(kind,arg)) return;
   if (kind === 'view') {
     view = arg;
     version = '';

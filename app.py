@@ -109,6 +109,21 @@ def init():
         CREATE TABLE IF NOT EXISTS balances (
           project TEXT PRIMARY KEY, day TEXT NOT NULL, amount INTEGER NOT NULL
         );
+        CREATE TABLE IF NOT EXISTS accrual_schedules (
+          id INTEGER PRIMARY KEY, entity INTEGER NOT NULL CHECK(entity IN (1,2)),
+          project TEXT NOT NULL, article TEXT NOT NULL, title TEXT NOT NULL,
+          amount INTEGER NOT NULL CHECK(amount<>0)
+        );
+        CREATE TABLE IF NOT EXISTS schedule_months (
+          id INTEGER PRIMARY KEY, schedule INTEGER NOT NULL REFERENCES accrual_schedules(id),
+          month TEXT NOT NULL, amount INTEGER NOT NULL CHECK(amount<>0),
+          UNIQUE(schedule,month)
+        );
+        CREATE TABLE IF NOT EXISTS accrual_schedule_payments (
+          operation INTEGER PRIMARY KEY REFERENCES operations(id),
+          schedule INTEGER NOT NULL REFERENCES accrual_schedules(id)
+        );
+        CREATE INDEX IF NOT EXISTS accrual_schedule_payments_schedule ON accrual_schedule_payments(schedule);
         CREATE TABLE IF NOT EXISTS accruals (
           id INTEGER PRIMARY KEY, month TEXT NOT NULL, project TEXT NOT NULL,
           article TEXT NOT NULL, amount INTEGER NOT NULL, description TEXT NOT NULL
@@ -176,11 +191,13 @@ def init():
             ("plans", "entity", "INTEGER"),
             ("plans", "source", "TEXT"),
             ("accruals", "entity", "INTEGER"),
+            ("accruals", "schedule_month", "INTEGER REFERENCES schedule_months(id)"),
             ("requests", "entity", "INTEGER"),
             ("requests", "payment_day", "TEXT"),
         ):
             if column not in {row["name"] for row in db.execute(f"PRAGMA table_info({table})")}:
                 db.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
+        db.execute("CREATE UNIQUE INDEX IF NOT EXISTS accrual_schedule_month ON accruals(schedule_month)")
         db.executemany("INSERT OR IGNORE INTO projects(name) VALUES(?)", [(name,) for name in SEED_PROJECTS])
         db.executemany("INSERT OR IGNORE INTO articles(name,direction) VALUES(?,?)", DEFAULT_ARTICLES.items())
         pnl_template.initialize(db, pnl_articles(DEFAULT_ARTICLES))
@@ -602,6 +619,8 @@ def link_profit_payment(db, decision, operation):
         raise ValueError("Списание связано с внутренним переводом.")
     if db.execute("SELECT 1 FROM request_payments WHERE operation=?", (operation,)).fetchone():
         raise ValueError("Списание уже связано с заявкой.")
+    if db.execute("SELECT 1 FROM accrual_schedule_payments WHERE operation=?", (operation,)).fetchone():
+        raise ValueError("Списание уже связано с графиком начислений.")
     if op["document_pending"] or db.execute(
         "SELECT 1 FROM allocations WHERE operation=? AND article<>'Дивиденды'", (operation,)
     ).fetchone():
@@ -609,6 +628,80 @@ def link_profit_payment(db, decision, operation):
     if -op["amount"] > item["amount"] - item["paid"]:
         raise ValueError("Списание превышает остаток к выплате.")
     db.execute("INSERT INTO profit_payments VALUES(?,?)", (operation, decision))
+    return True
+
+
+def accrual_schedule(db, payload, save):
+    entity, project, article = entity_id(payload), payload["project"], payload["article"]
+    ensure_project(db, project)
+    amount = money(payload["amount"])
+    ensure_article(db, article, amount, accrual=True)
+    title = payload["title"].strip()
+    start = month(payload["start"])
+    count = int(str(payload["count"]))
+    if not title or len(title) > 200 or not 1 <= count <= 60 or abs(amount) < count:
+        raise ValueError("Укажите название, срок от 1 до 60 месяцев и сумму не меньше копейки на месяц.")
+    year, start_month = map(int, start.split("-"))
+    base, remainder = divmod(abs(amount), count)
+    direction = 1 if amount > 0 else -1
+    months = []
+    for offset in range(count):
+        years, remainder_month = divmod(start_month - 1 + offset, 12)
+        period = date(year + years, remainder_month + 1, 1).isoformat()[:7]
+        months.append({"month": period, "amount": direction * (base + (offset < remainder))})
+    result = {"months": months, "amount": amount}
+    if save:
+        schedule = db.execute("""
+            INSERT INTO accrual_schedules(entity,project,article,title,amount) VALUES(?,?,?,?,?)
+        """, (entity, project, article, title, amount)).lastrowid
+        db.executemany("INSERT INTO schedule_months(schedule,month,amount) VALUES(?,?,?)",
+                       [(schedule, entry["month"], entry["amount"]) for entry in months])
+        result["schedule"] = schedule
+    return result
+
+
+def confirm_schedule_month(db, item):
+    row = db.execute("""
+        SELECT m.month,m.amount,s.project,s.article,s.title,s.entity FROM schedule_months m
+        JOIN accrual_schedules s ON m.schedule=s.id WHERE m.id=?
+    """, (item,)).fetchone()
+    if not row:
+        raise ValueError("Строка графика не найдена.")
+    if db.execute("SELECT 1 FROM accruals WHERE schedule_month=?", (item,)).fetchone():
+        return False
+    db.execute("""
+        INSERT INTO accruals(month,project,article,amount,description,entity,schedule_month) VALUES(?,?,?,?,?,?,?)
+    """, (row["month"], row["project"], row["article"], row["amount"], row["title"], row["entity"], item))
+    return True
+
+
+def link_accrual_schedule(db, schedule, operation):
+    item = db.execute("SELECT * FROM accrual_schedules WHERE id=?", (schedule,)).fetchone()
+    op = db.execute("""
+        SELECT o.amount,a.entity FROM operations o JOIN accounts a ON a.id=o.account WHERE o.id=?
+    """, (operation,)).fetchone()
+    if not item or not op or op["entity"] != item["entity"] or op["amount"] * item["amount"] <= 0:
+        raise ValueError("Выберите банковскую операцию нужного ООО и направления.")
+    previous = db.execute("SELECT schedule FROM accrual_schedule_payments WHERE operation=?", (operation,)).fetchone()
+    if previous:
+        if previous["schedule"] == schedule:
+            return False
+        raise ValueError("Операция уже связана с другим графиком.")
+    if is_profit_payment(db, operation) or db.execute(
+        "SELECT 1 FROM transfers WHERE outgoing=? OR incoming=?", (operation, operation)
+    ).fetchone():
+        raise ValueError("Операция уже связана с переводом или выплатой прибыли.")
+    allocations = db.execute("SELECT project,article,accrual FROM allocations WHERE operation=?", (operation,)).fetchall()
+    if not allocations or any(row["project"] != item["project"] or row["accrual"] or row["article"] in NON_OPERATING
+                              for row in allocations):
+        raise ValueError("Разнесите операцию на проект графика и оставьте месяц БДР пустым.")
+    paid = db.execute("""
+        SELECT COALESCE(SUM(ABS(o.amount)),0) FROM accrual_schedule_payments p
+        JOIN operations o ON o.id=p.operation WHERE p.schedule=?
+    """, (schedule,)).fetchone()[0]
+    if paid + abs(op["amount"]) > abs(item["amount"]):
+        raise ValueError("Сумма связанных оплат превысит сумму графика.")
+    db.execute("INSERT INTO accrual_schedule_payments VALUES(?,?)", (operation, schedule))
     return True
 
 
@@ -625,6 +718,39 @@ def mutate(db, action, payload, actor, role):
     elif action == "apply-bank-suggestions":
         result["applied"] = apply_bank_suggestions(db, payload["ids"])
         target = str(result["applied"])
+    elif action == "preview-accrual-schedule":
+        return accrual_schedule(db, payload, save=False)
+    elif action == "accrual-schedule":
+        result = accrual_schedule(db, payload, save=True)
+        target = str(result["schedule"])
+    elif action == "confirm-schedule-month":
+        target = str(int(payload["id"]))
+        if not confirm_schedule_month(db, target):
+            return result
+    elif action == "undo-schedule-month":
+        target = str(int(payload["id"]))
+        if db.execute("DELETE FROM accruals WHERE schedule_month=?", (target,)).rowcount != 1:
+            raise ValueError("Подтверждённая строка графика не найдена.")
+    elif action == "remove-draft-schedule":
+        target = str(int(payload["id"]))
+        if db.execute("SELECT 1 FROM accrual_schedule_payments WHERE schedule=?", (target,)).fetchone() or db.execute("""
+            SELECT 1 FROM accruals a JOIN schedule_months m ON m.id=a.schedule_month WHERE m.schedule=?
+        """, (target,)).fetchone():
+            raise ValueError("Сначала снимите подтверждения и отвяжите оплаты.")
+        db.execute("DELETE FROM schedule_months WHERE schedule=?", (target,))
+        if db.execute("DELETE FROM accrual_schedules WHERE id=?", (target,)).rowcount != 1:
+            raise ValueError("График не найден.")
+    elif action == "link-accrual-schedule":
+        schedule, operation = int(payload["schedule"]), int(payload["operation"])
+        if not link_accrual_schedule(db, schedule, operation):
+            return result
+        target = f"{schedule}:{operation}"
+    elif action == "unlink-accrual-schedule":
+        operation = int(payload["operation"])
+        row = db.execute("DELETE FROM accrual_schedule_payments WHERE operation=? RETURNING schedule", (operation,)).fetchone()
+        if not row:
+            raise ValueError("Связь с графиком не найдена.")
+        target = f'{row["schedule"]}:{operation}'
     elif action == "pnl-template":
         directions = {row["name"]: row["direction"] for row in db.execute("SELECT name,direction FROM articles")}
         result["revision"] = pnl_template.save(db, payload, pnl_articles(directions))
@@ -787,6 +913,12 @@ def mutate(db, action, payload, actor, role):
         """, (oid,)).fetchone()
         if linked and any(row[1:3] != tuple(linked) for row in rows):
             raise ValueError("Проект и статья операции должны совпадать со связанной заявкой.")
+        schedule = db.execute("""
+            SELECT s.project FROM accrual_schedule_payments p JOIN accrual_schedules s ON p.schedule=s.id
+            WHERE p.operation=?
+        """, (oid,)).fetchone()
+        if schedule and any(row[1] != schedule["project"] or row[4] or row[2] in NON_OPERATING for row in rows):
+            raise ValueError("Оплата связана с графиком. Сохраните его проект и оставьте месяц БДР пустым.")
         pending = payload.get("documentPending", bool(op["document_pending"])) is True
         if pending and any(row[4] for row in rows):
             raise ValueError("Пока ждёте акт или другой документ, оставьте месяц БДР пустым.")
@@ -922,7 +1054,8 @@ class Handler(BaseHTTPRequestHandler):
                 db.execute("BEGIN")
                 data = {table: [dict(row) for row in db.execute(f"SELECT * FROM {table}")]
                         for table in ("allocations", "plans", "accruals", "balances", "accounts", "account_balances", "statement_controls", "bank_statements", "transfers", "request_payments", "forecast_entries",
-                                      "funds", "fund_entries", "profit_payments", "office_contributions", "clients") if role == "finance"}
+                                      "funds", "fund_entries", "profit_payments", "office_contributions", "clients",
+                                      "accrual_schedules", "schedule_months", "accrual_schedule_payments") if role == "finance"}
                 if role == "finance":
                     data["operations"] = read_operation_rows(db)
                     data["client_payers"] = [dict(row) for row in db.execute("SELECT DISTINCT client,payer FROM client_payers")]
@@ -938,7 +1071,8 @@ class Handler(BaseHTTPRequestHandler):
                 data.update(entities=ENTITIES, projects=projects, articles=list(directions), articleDirections=directions, cashStages=CASH_STAGES,
                             scenarios=SCENARIOS, user=name, role=role, demo=not USERS)
                 return self.reply(200, data)
-        assets = {"/": ("index.html", "text/html"), "/style.css": ("style.css", "text/css"), "/app.js": ("app.js", "text/javascript"), "/pnl.js": ("pnl.js", "text/javascript")}
+        assets = {"/": ("index.html", "text/html"), "/style.css": ("style.css", "text/css"), "/app.js": ("app.js", "text/javascript"), "/pnl.js": ("pnl.js", "text/javascript"),
+                  "/schedules.js": ("schedules.js", "text/javascript")}
         if path in assets:
             filename, mime = assets[path]
             return self.send_data(200, (ROOT / "web" / filename).read_bytes(), mime + "; charset=utf-8")
