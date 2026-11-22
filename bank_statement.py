@@ -142,6 +142,8 @@ def hints(description, amount):
     purpose = description.casefold().replace("ё", "е").strip()
     if re.search(r"\b(?:депозит\w*|овернайт|между своими счетами|перевод собственных средств)\b", purpose):
         return None, None, "transfer"
+    if amount > 0 and re.search(r"\bвозврат\w*\s+(?:части\s+)?(?:аванса|предоплаты)\b", purpose):
+        return None, None, None
     document = "advance" if re.search(r"\b(?:аванс\w*|предоплат\w*)\b", purpose) else None
     project = "Ро-бот" if re.search(r"\bро[– -]бот\b", purpose) else None
     article = None
@@ -159,6 +161,12 @@ def hints(description, amount):
             if re.search(pattern, purpose):
                 article = category
                 break
+    elif document:
+        article = "Аванс от клиента"
+    elif re.search(r"промежуточн\w+ плат", purpose):
+        article = "Промежуточный платёж"
+    elif re.search(r"(?:окончательн\w+|полн\w+)\s+расч[её]т", purpose):
+        article = "Окончательный расчёт"
     elif re.search(r"\bлицензи\w*\b", purpose):
         article = "Лицензии"
     return article, project, document

@@ -18,8 +18,16 @@ import bank_statement
 ROOT = Path(__file__).resolve().parent
 DB = Path(os.environ.get("QODEX_DB", ROOT / "data" / "finance.sqlite3"))
 USERS = json.loads(os.environ.get("QODEX_USERS", "{}"))
-PROJECTS = ["Ро-бот", "Проект 2", "Проект 3", "Офис"]
-ARTICLES = ["Лицензии", "Услуги", "Разработка", "Дизайн", "Инфраструктура", "Продажи", "Офисные расходы", "Налоги", "Финансирование", "Дивиденды", "ФОТ", "Поддержка", "Прямые расходы на клиентов", "Банковские комиссии"]
+SEED_PROJECTS = ["Ро-бот", "Проект 2", "Проект 3", "Офис"]
+SEED_ARTICLES = ["Лицензии", "Услуги", "Разработка", "Дизайн", "Инфраструктура", "Продажи", "Офисные расходы", "Налоги", "Финансирование", "Дивиденды", "ФОТ", "Поддержка", "Прямые расходы на клиентов", "Банковские комиссии"]
+CASH_STAGES = ("Аванс от клиента", "Промежуточный платёж", "Окончательный расчёт")
+NON_OPERATING = ("Финансирование", "Дивиденды")
+DEFAULT_ARTICLES = {
+    **dict.fromkeys(SEED_ARTICLES, "expense"),
+    **dict.fromkeys(("Лицензии", "Услуги", "Выручка по проекту", *CASH_STAGES, "Прочие поступления"), "income"),
+    "Услуги поставщиков": "expense",
+    "Финансирование": "both",
+}
 ENTITIES = ["ООО 1", "ООО 2"]
 SCENARIOS = ["Базовый", "Консервативный", "Оптимистичный"]
 
@@ -35,6 +43,20 @@ def init():
     DB.parent.mkdir(parents=True, exist_ok=True)
     with closing(connect()) as db, db:
         db.executescript("""
+        CREATE TABLE IF NOT EXISTS projects (
+          id INTEGER PRIMARY KEY, name TEXT NOT NULL UNIQUE
+        );
+        CREATE TABLE IF NOT EXISTS articles (
+          id INTEGER PRIMARY KEY, name TEXT NOT NULL UNIQUE,
+          direction TEXT NOT NULL CHECK(direction IN ('income','expense','both'))
+        );
+        CREATE TABLE IF NOT EXISTS clients (
+          id INTEGER PRIMARY KEY, name TEXT NOT NULL UNIQUE
+        );
+        CREATE TABLE IF NOT EXISTS client_payers (
+          party_key TEXT PRIMARY KEY, client INTEGER NOT NULL REFERENCES clients(id),
+          payer TEXT NOT NULL
+        );
         CREATE TABLE IF NOT EXISTS accounts (
           id INTEGER PRIMARY KEY, entity INTEGER NOT NULL CHECK(entity IN (1,2)),
           name TEXT NOT NULL, UNIQUE(entity,name)
@@ -140,6 +162,9 @@ def init():
             ("operations", "counterparty", "TEXT"),
             ("operations", "party_key", "TEXT"),
             ("operations", "document_pending", "INTEGER NOT NULL DEFAULT 0"),
+            ("operations", "payer_label", "TEXT"),
+            ("operations", "client", "INTEGER REFERENCES clients(id)"),
+            ("allocations", "accrual_article", "TEXT"),
             ("plans", "entity", "INTEGER"),
             ("plans", "source", "TEXT"),
             ("accruals", "entity", "INTEGER"),
@@ -148,6 +173,8 @@ def init():
         ):
             if column not in {row["name"] for row in db.execute(f"PRAGMA table_info({table})")}:
                 db.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
+        db.executemany("INSERT OR IGNORE INTO projects(name) VALUES(?)", [(name,) for name in SEED_PROJECTS])
+        db.executemany("INSERT OR IGNORE INTO articles(name,direction) VALUES(?,?)", DEFAULT_ARTICLES.items())
         db.execute("CREATE UNIQUE INDEX IF NOT EXISTS accounts_bank_key ON accounts(bank_key)")
         db.execute("UPDATE operations SET account=CASE WHEN ref IN ('demo-1','demo-2') THEN 2 ELSE 1 END "
                    "WHERE account IS NULL AND ref LIKE 'demo-%'")
@@ -167,22 +194,22 @@ def init():
                 oid = db.execute("INSERT INTO operations(ref,day,description,amount,account) VALUES(?,?,?,?,?)",
                                  (f"demo-{i}", day, desc, amount * 100, 2 if i in (1,2) else 1)).lastrowid
                 if project is not None:
-                    db.execute("INSERT INTO allocations VALUES(?,?,?,?,?)",
-                               (oid, PROJECTS[project], ARTICLES[article], amount * 100, day[:7]))
+                    db.execute("INSERT INTO allocations(operation,project,article,amount,accrual) VALUES(?,?,?,?,?)",
+                               (oid, SEED_PROJECTS[project], SEED_ARTICLES[article], amount * 100, day[:7]))
             for idx, (income, expense) in enumerate([(1180, 940), (1440, 1130), (1580, 1270), (1980, 1420), (2150, 1480), (2500, 1530)], 1):
                 period = f"2026-{idx:02d}"
                 for basis in ("БДДС", "БДР"):
                     db.executemany("INSERT INTO plans(month,project,article,amount,basis,scenario,entity) VALUES(?,?,?,?,?,?,?)",
-                                   [(period, PROJECTS[0], ARTICLES[0], income * 100000, basis, SCENARIOS[0], 1),
-                                    (period, PROJECTS[0], ARTICLES[2], -expense * 100000, basis, SCENARIOS[0], 1)])
+                                   [(period, SEED_PROJECTS[0], SEED_ARTICLES[0], income * 100000, basis, SCENARIOS[0], 1),
+                                    (period, SEED_PROJECTS[0], SEED_ARTICLES[2], -expense * 100000, basis, SCENARIOS[0], 1)])
                 if idx < 6:
                     for tag, amount, article in [("in", income - 70, 0), ("out", -expense + 45, 2)]:
                         oid = db.execute("INSERT INTO operations(ref,day,description,amount,account) VALUES(?,?,?,?,?)",
-                                         (f"demo-{period}-{tag}", period + "-15", ARTICLES[article], amount * 100000, 1)).lastrowid
-                        db.execute("INSERT INTO allocations VALUES(?,?,?,?,?)", (oid, PROJECTS[0], ARTICLES[article], amount * 100000, period))
+                                         (f"demo-{period}-{tag}", period + "-15", SEED_ARTICLES[article], amount * 100000, 1)).lastrowid
+                        db.execute("INSERT INTO allocations(operation,project,article,amount,accrual) VALUES(?,?,?,?,?)", (oid, SEED_PROJECTS[0], SEED_ARTICLES[article], amount * 100000, period))
             db.executemany("INSERT INTO requests(title,author,day,project,article,amount,entity) VALUES(?,?,?,?,?,?,?)",
-                           [("Дизайн личного кабинета", "Команда продукта", "2026-06-27", PROJECTS[0], ARTICLES[3], 8500000, 1),
-                            ("Облачные ресурсы на июнь", "Техлид", "2026-06-29", PROJECTS[1], ARTICLES[4], 4200000, 2)])
+                           [("Дизайн личного кабинета", "Команда продукта", "2026-06-27", SEED_PROJECTS[0], SEED_ARTICLES[3], 8500000, 1),
+                            ("Облачные ресурсы на июнь", "Техлид", "2026-06-29", SEED_PROJECTS[1], SEED_ARTICLES[4], 4200000, 2)])
 
 
 def money(value, allow_zero=False):
@@ -200,10 +227,59 @@ def month(value):
     return day(value + "-01")[:7]
 
 
-def dimensions(row):
-    if row["project"] not in PROJECTS or row["article"] not in ARTICLES:
-        raise ValueError("Выберите проект и статью из списка.")
-    return row["project"], row["article"]
+def ensure_project(db, project):
+    if not db.execute("SELECT 1 FROM projects WHERE name=?", (project,)).fetchone():
+        raise ValueError("Выберите проект из списка.")
+
+
+def allow_article(direction, amount):
+    return direction == "both" or direction == ("income" if amount > 0 else "expense")
+
+
+def ensure_article(db, article, amount, accrual=False):
+    row = db.execute("SELECT direction FROM articles WHERE name=?", (article,)).fetchone()
+    if not row or not allow_article(row["direction"], amount):
+        raise ValueError("Выберите статью для поступления." if amount > 0 else "Выберите статью для расхода.")
+    if accrual and article in (*NON_OPERATING, *CASH_STAGES):
+        raise ValueError("Для БДР выберите статью начисления, например «Выручка по проекту».")
+
+
+def directory_name(db, table, raw, limit=100):
+    name = raw.strip()
+    if not name or len(name) > limit:
+        raise ValueError(f"Укажите название до {limit} символов.")
+    if any(row["name"].casefold() == name.casefold() for row in db.execute(f"SELECT name FROM {table}")):
+        raise ValueError("Такое название уже есть в справочнике.")
+    return name
+
+
+def add_client(db, raw):
+    name = directory_name(db, "clients", raw)
+    return db.execute("INSERT INTO clients(name) VALUES(?)", (name,)).lastrowid
+
+
+def assign_receipt_client(db, oid, op, payload):
+    if op["amount"] <= 0 or "client" not in payload:
+        return
+    new_client = (payload.get("newClient") or "").strip()
+    client = int(payload["client"]) if payload["client"] else None
+    if new_client:
+        if client is not None:
+            raise ValueError("Выберите существующего клиента или создайте нового.")
+        client = add_client(db, new_client)
+    if client is not None and not db.execute("SELECT 1 FROM clients WHERE id=?", (client,)).fetchone():
+        raise ValueError("Выберите клиента из справочника.")
+    payer = (payload.get("payer") or "").strip()
+    if len(payer) > 200:
+        raise ValueError("Название плательщика должно быть до 200 символов.")
+    if payload.get("rememberClient") is True:
+        if not op["party_key"] or not client:
+            raise ValueError("Для запоминания выберите клиента и банковского плательщика.")
+        db.execute("""
+            INSERT INTO client_payers(party_key,client,payer) VALUES(?,?,?)
+            ON CONFLICT(party_key) DO UPDATE SET client=excluded.client,payer=excluded.payer
+        """, (op["party_key"], client, op["counterparty"]))
+    db.execute("UPDATE operations SET client=?, payer_label=? WHERE id=?", (client, payer or None, oid))
 
 
 def entity_id(payload):
@@ -230,7 +306,8 @@ def import_statement(db, source, account):
     for n, row in enumerate(reader, 2):
         try:
             when, description, amount = day(row["date"]), row["description"].strip(), money(row["amount"])
-            if not description:
+            counterparty = (row.get("counterparty") or "").strip()
+            if not description or len(counterparty) > 200:
                 raise ValueError()
         except (ValueError, InvalidOperation, AttributeError, TypeError) as exc:
             raise ValueError(f"Проверьте дату, описание и сумму в строке {n}.") from exc
@@ -238,14 +315,19 @@ def import_statement(db, source, account):
         key = [external_id] if external_id else [when, description, amount]
         ref = "bank:" + hashlib.sha256(json.dumps([account, *key], ensure_ascii=False).encode()).hexdigest()
         legacy_ref = "bank:" + hashlib.sha256(json.dumps(key, ensure_ascii=False).encode()).hexdigest()
-        existing = db.execute("SELECT day,description,amount FROM operations WHERE account=? AND ref IN (?,?)",
+        existing = db.execute("SELECT id,day,description,amount,counterparty FROM operations WHERE account=? AND ref IN (?,?)",
                               (account, ref, legacy_ref)).fetchone()
         if existing:
-            if tuple(existing) != (when, description, amount):
+            if (existing["day"], existing["description"], existing["amount"]) != (when, description, amount):
                 raise ValueError(f"В строке {n} повторяется ID с другими реквизитами.")
+            if counterparty and existing["counterparty"] and existing["counterparty"] != counterparty:
+                raise ValueError(f"В строке {n} повторяется операция с другим плательщиком. Проверьте банковский ID.")
+            if counterparty and not existing["counterparty"]:
+                db.execute("UPDATE operations SET counterparty=? WHERE id=?", (counterparty, existing["id"]))
             duplicates += 1
             continue
-        db.execute("INSERT INTO operations(ref,day,description,amount,account) VALUES(?,?,?,?,?)", (ref, when, description, amount, account))
+        db.execute("INSERT INTO operations(ref,day,description,amount,account,counterparty) VALUES(?,?,?,?,?,?)",
+                   (ref, when, description, amount, account, counterparty or None))
         count += 1
     if not count and not duplicates:
         raise ValueError("В выписке нет операций.")
@@ -301,7 +383,7 @@ def link_payment(db, request, operation):
     if any(tuple(line) != dimensions for line in lines):
         raise ValueError("Проект и статья каждой доли операции должны совпадать с заявкой.")
     if not lines:
-        db.execute("INSERT INTO allocations VALUES(?,?,?,?,NULL)", (operation, *dimensions, op["amount"]))
+        db.execute("INSERT INTO allocations(operation,project,article,amount,accrual) VALUES(?,?,?,?,NULL)", (operation, *dimensions, op["amount"]))
     db.execute("INSERT INTO request_payments VALUES(?,?)", (operation, request))
     return True
 
@@ -347,12 +429,12 @@ def find_statement_account(db, choice, statement):
     return account, registered["entity"], key
 
 
-def operation_hint(op, rule):
+def operation_hint(op, rule, directions):
     if not op["ref"].startswith("tochka:"):
         return None, None, None
     article, project, flag = bank_statement.hints(op["description"], op["amount"])
-    if rule and flag != "transfer":
-        return rule["article"], rule["project"], flag
+    if rule and flag != "transfer" and allow_article(directions.get(rule["article"]), op["amount"]):
+        return article if article in CASH_STAGES else rule["article"], rule["project"], flag
     return article, project, flag
 
 
@@ -399,12 +481,17 @@ def import_tochka(db, payload, save):
 
 def read_operation_rows(db):
     rules = {(row["account"], row["party_key"], row["direction"]): row for row in db.execute("SELECT * FROM bank_rules")}
+    clients = {row["party_key"]: row["client"] for row in db.execute("SELECT party_key,client FROM client_payers")}
+    directions = {row["name"]: row["direction"] for row in db.execute("SELECT name,direction FROM articles")}
     operations = []
     for row in db.execute("SELECT * FROM operations"):
         op = dict(row)
-        rule = rules.get((op["account"], op.pop("party_key"), 1 if op["amount"] > 0 else -1))
-        article, project, flag = operation_hint(op, rule)
-        operations.append({**op, "suggested_article": article, "suggested_project": project, "bank_hint": flag})
+        key = op.pop("party_key")
+        rule = rules.get((op["account"], key, 1 if op["amount"] > 0 else -1))
+        article, project, flag = operation_hint(op, rule, directions)
+        operations.append({**op, "suggested_article": article, "suggested_project": project, "bank_hint": flag,
+                           "suggested_client": clients.get(key) if op["amount"] > 0 else None,
+                           "has_bank_payer": bool(key)})
     return operations
 
 
@@ -423,10 +510,12 @@ def apply_bank_suggestions(db, ids):
             "SELECT 1 FROM transfers WHERE outgoing=? OR incoming=?", (oid, oid)
         ).fetchone():
             continue
-        db.execute("INSERT INTO allocations VALUES(?,?,?,?,NULL)",
+        db.execute("INSERT INTO allocations(operation,project,article,amount,accrual) VALUES(?,?,?,?,NULL)",
                    (oid, op["suggested_project"], op["suggested_article"], op["amount"]))
         if op["bank_hint"] == "advance":
             db.execute("UPDATE operations SET document_pending=1 WHERE id=?", (oid,))
+        if op["suggested_client"] and op["client"] is None:
+            db.execute("UPDATE operations SET client=? WHERE id=?", (op["suggested_client"], oid))
         count += 1
     return count
 
@@ -527,6 +616,19 @@ def mutate(db, action, payload, actor, role):
     elif action == "apply-bank-suggestions":
         result["applied"] = apply_bank_suggestions(db, payload["ids"])
         target = str(result["applied"])
+    elif action == "project":
+        name = directory_name(db, "projects", payload["name"])
+        target = str(db.execute("INSERT INTO projects(name) VALUES(?)", (name,)).lastrowid)
+    elif action == "article":
+        name = directory_name(db, "articles", payload["name"])
+        direction = payload["direction"]
+        if direction not in ("income", "expense"):
+            raise ValueError("Выберите поступление или расход.")
+        if name.casefold() in ("без распределения", "между счетами", "между ооо"):
+            raise ValueError("Это название используется в банковских отчётах.")
+        target = str(db.execute("INSERT INTO articles(name,direction) VALUES(?,?)", (name, direction)).lastrowid)
+    elif action == "client":
+        target = str(add_client(db, payload["name"]))
     elif action == "fund":
         name = payload["name"].strip()
         if not name or len(name) > 80:
@@ -549,7 +651,8 @@ def mutate(db, action, payload, actor, role):
     elif action == "office-contribution":
         entity, period = entity_id(payload), month(payload["month"])
         project = payload["project"]
-        if project not in PROJECTS or project == "Офис":
+        ensure_project(db, project)
+        if project == "Офис":
             raise ValueError("Выберите проект.")
         amount = money(payload["amount"], allow_zero=True)
         if amount < 0:
@@ -644,10 +747,25 @@ def mutate(db, action, payload, actor, role):
             raise ValueError("Сначала отвяжите списание от решения о выплате.")
         if db.execute("SELECT 1 FROM transfers WHERE outgoing=? OR incoming=?", (oid, oid)).fetchone():
             raise ValueError("Сначала разорвите связь внутреннего перевода.")
-        op = db.execute("SELECT amount,account,party_key,document_pending FROM operations WHERE id=?", (oid,)).fetchone()
+        op = db.execute("SELECT amount,account,party_key,counterparty,document_pending FROM operations WHERE id=?", (oid,)).fetchone()
         if not op:
             raise ValueError("Операция не найдена.")
-        rows = [(oid, *dimensions(row), money(row["amount"]), month(row["accrual"]) if row.get("accrual") else None) for row in payload["lines"]]
+        previous = {row["article"] for row in db.execute("SELECT article FROM allocations WHERE operation=?", (oid,))}
+        rows = []
+        for row in payload["lines"]:
+            project, article = row["project"], row["article"]
+            amount = money(row["amount"])
+            ensure_project(db, project)
+            if article not in previous:
+                ensure_article(db, article, op["amount"])
+            accrual = month(row["accrual"]) if row.get("accrual") else None
+            accrual_article = row.get("accrualArticle") or None
+            if accrual and article in CASH_STAGES and not accrual_article:
+                accrual_article = "Выручка по проекту"
+            if accrual_article and accrual:
+                ensure_article(db, accrual_article, amount, accrual=True)
+            rows.append((oid, project, article, amount, accrual, accrual_article if accrual else None))
+
         if not rows or sum(row[3] for row in rows) != op["amount"] or any(row[3] * op["amount"] <= 0 for row in rows):
             raise ValueError("Сумма строк и знак должны совпадать с суммой операции.")
         linked = db.execute("""
@@ -666,36 +784,45 @@ def mutate(db, action, payload, actor, role):
                 INSERT INTO bank_rules VALUES(?,?,?,?,?)
                 ON CONFLICT(account,party_key,direction) DO UPDATE SET project=excluded.project,article=excluded.article
             """, (op["account"], op["party_key"], 1 if op["amount"] > 0 else -1, rows[0][1], rows[0][2]))
+        assign_receipt_client(db, oid, op, payload)
         db.execute("UPDATE operations SET document_pending=? WHERE id=?", (pending, oid))
         db.execute("DELETE FROM allocations WHERE operation=?", (oid,))
-        db.executemany("INSERT INTO allocations VALUES(?,?,?,?,?)", rows)
+        db.executemany("INSERT INTO allocations(operation,project,article,amount,accrual,accrual_article) VALUES(?,?,?,?,?,?)", rows)
         target = str(oid)
     elif action == "balance":
         target = payload["project"]
-        if target not in ["", *PROJECTS]:
-            raise ValueError("Выберите проект из списка.")
+        if target:
+            ensure_project(db, target)
         db.execute("INSERT INTO balances VALUES(?,?,?) ON CONFLICT(project) DO UPDATE SET day=excluded.day,amount=excluded.amount",
                    (target, day(payload["day"]), money(payload["amount"], allow_zero=True)))
-    elif action == "accrual":
-        description = payload["description"].strip()
-        if not description or payload["article"] in ("Финансирование", "Дивиденды"):
-            raise ValueError("Укажите содержание начисления и операционную статью.")
-        target = str(db.execute("INSERT INTO accruals(month,project,article,amount,description,entity) VALUES(?,?,?,?,?,?)",
-                                (month(payload["month"]), *dimensions(payload), money(payload["amount"]), description, entity_id(payload))).lastrowid)
-    elif action == "plan":
-        if payload["basis"] not in ("БДР", "БДДС") or payload["scenario"] not in SCENARIOS:
-            raise ValueError("Проверьте тип бюджета и сценарий.")
-        if payload["basis"] == "БДР" and payload["article"] in ("Финансирование", "Дивиденды"):
-            raise ValueError("Финансирование и дивиденды включаются в БДДС.")
-        target = str(db.execute("INSERT INTO plans(month,project,article,amount,basis,scenario,entity) VALUES(?,?,?,?,?,?,?)",
-                                (month(payload["month"]), *dimensions(payload), money(payload["amount"]), payload["basis"], payload["scenario"], entity_id(payload))).lastrowid)
-    elif action == "request":
-        title = payload["title"].strip()
+    elif action in ("accrual", "plan", "request"):
+        project, article = payload["project"], payload["article"]
+        ensure_project(db, project)
         amount = money(payload["amount"])
-        if not title or len(title) > 200 or amount <= 0 or payload["article"] in ("Лицензии", "Услуги"):
-            raise ValueError("Укажите назначение, статью расхода и положительную сумму.")
-        target = str(db.execute("INSERT INTO requests(title,author,day,project,article,amount,entity) VALUES(?,?,?,?,?,?,?)",
-                                (title, actor, day(payload["day"]), *dimensions(payload), amount, entity_id(payload))).lastrowid)
+        if action == "accrual":
+            ensure_article(db, article, amount, accrual=True)
+            description = payload["description"].strip()
+            if not description:
+                raise ValueError("Укажите содержание начисления.")
+            target = str(db.execute("""
+                INSERT INTO accruals(month,project,article,amount,description,entity) VALUES(?,?,?,?,?,?)
+            """, (month(payload["month"]), project, article, amount, description, entity_id(payload))).lastrowid)
+        elif action == "plan":
+            basis, scenario = payload["basis"], payload["scenario"]
+            if basis not in ("БДР", "БДДС") or scenario not in SCENARIOS:
+                raise ValueError("Проверьте тип бюджета и сценарий.")
+            ensure_article(db, article, amount, accrual=basis == "БДР")
+            target = str(db.execute("""
+                INSERT INTO plans(month,project,article,amount,basis,scenario,entity) VALUES(?,?,?,?,?,?,?)
+            """, (month(payload["month"]), project, article, amount, basis, scenario, entity_id(payload))).lastrowid)
+        else:
+            ensure_article(db, article, -1)
+            title = payload["title"].strip()
+            if not title or len(title) > 200 or amount <= 0:
+                raise ValueError("Укажите назначение, статью расхода и положительную сумму.")
+            target = str(db.execute("""
+                INSERT INTO requests(title,author,day,project,article,amount,entity) VALUES(?,?,?,?,?,?,?)
+            """, (title, actor, day(payload["day"]), project, article, amount, entity_id(payload))).lastrowid)
     elif action == "freeze-budget":
         result["version"] = freeze_budget(db, payload, actor)
         target = str(result["version"])
@@ -782,16 +909,20 @@ class Handler(BaseHTTPRequestHandler):
                 db.execute("BEGIN")
                 data = {table: [dict(row) for row in db.execute(f"SELECT * FROM {table}")]
                         for table in ("allocations", "plans", "accruals", "balances", "accounts", "account_balances", "statement_controls", "bank_statements", "transfers", "request_payments", "forecast_entries",
-                                      "funds", "fund_entries", "profit_payments", "office_contributions") if role == "finance"}
+                                      "funds", "fund_entries", "profit_payments", "office_contributions", "clients") if role == "finance"}
                 if role == "finance":
                     data["operations"] = read_operation_rows(db)
+                    data["client_payers"] = [dict(row) for row in db.execute("SELECT DISTINCT client,payer FROM client_payers")]
                     data["profit_decisions"] = profit_decision_rows(db)
                     data["budget_versions"] = [
                         {**dict(row), "rows": json.loads(row["rows"])}
                         for row in db.execute("SELECT * FROM budget_versions ORDER BY id DESC")
                     ]
                 data["requests"] = request_rows(db, None if role == "finance" else name)
-                data.update(entities=ENTITIES, projects=PROJECTS, articles=ARTICLES, scenarios=SCENARIOS, user=name, role=role, demo=not USERS)
+                projects = [row["name"] for row in db.execute("SELECT name FROM projects ORDER BY name='Офис', id")]
+                directions = {row["name"]: row["direction"] for row in db.execute("SELECT name,direction FROM articles ORDER BY id")}
+                data.update(entities=ENTITIES, projects=projects, articles=list(directions), articleDirections=directions, cashStages=CASH_STAGES,
+                            scenarios=SCENARIOS, user=name, role=role, demo=not USERS)
                 return self.reply(200, data)
         assets = {"/": ("index.html", "text/html"), "/style.css": ("style.css", "text/css"), "/app.js": ("app.js", "text/javascript")}
         if path in assets:
