@@ -103,6 +103,11 @@ def init():
           amount INTEGER NOT NULL CHECK(amount>0), fund INTEGER REFERENCES funds(id),
           canceled INTEGER NOT NULL DEFAULT 0 CHECK(canceled IN (0,1)), actor TEXT NOT NULL
         );
+        CREATE TABLE IF NOT EXISTS profit_payments (
+          operation INTEGER PRIMARY KEY REFERENCES operations(id),
+          decision INTEGER NOT NULL REFERENCES profit_decisions(id)
+        );
+        CREATE INDEX IF NOT EXISTS profit_payments_decision ON profit_payments(decision);
         CREATE TABLE IF NOT EXISTS fund_entries (
           id INTEGER PRIMARY KEY, fund INTEGER NOT NULL REFERENCES funds(id),
           day TEXT NOT NULL, amount INTEGER NOT NULL CHECK(amount<>0), note TEXT NOT NULL,
@@ -257,6 +262,20 @@ def request_rows(db, author=None):
     """, params)]
 
 
+def payer_debit(db, operation, entity):
+    op = db.execute("""
+        SELECT o.amount, o.document_pending, a.entity FROM operations o JOIN accounts a ON a.id=o.account
+        WHERE o.id=? AND o.amount<0
+    """, (operation,)).fetchone()
+    if not op or op["entity"] != entity:
+        raise ValueError("Выберите банковское списание со счёта ООО-плательщика.")
+    return op
+
+
+def is_profit_payment(db, operation):
+    return db.execute("SELECT 1 FROM profit_payments WHERE operation=?", (operation,)).fetchone() is not None
+
+
 def link_payment(db, request, operation):
     item = db.execute("SELECT * FROM requests WHERE id=?", (request,)).fetchone()
     if not item or item["status"] != "Согласована":
@@ -266,12 +285,9 @@ def link_payment(db, request, operation):
         if old["request"] == request:
             return False
         raise ValueError("Операция уже связана с другой заявкой.")
-    op = db.execute("""
-        SELECT o.amount, a.entity FROM operations o JOIN accounts a ON a.id=o.account
-        WHERE o.id=? AND o.amount<0
-    """, (operation,)).fetchone()
-    if not op or op["entity"] != item["entity"]:
-        raise ValueError("Выберите банковское списание со счёта ООО-плательщика.")
+    op = payer_debit(db, operation, item["entity"])
+    if is_profit_payment(db, operation):
+        raise ValueError("Списание уже связано с выплатой собственникам.")
     if db.execute("SELECT 1 FROM transfers WHERE outgoing=?", (operation,)).fetchone():
         raise ValueError("Внутренний перевод нельзя связать с заявкой.")
     paid = db.execute("""
@@ -401,6 +417,8 @@ def apply_bank_suggestions(db, ids):
         op = by_id.get(oid)
         if not op or not op["suggested_project"] or not op["suggested_article"] or op["bank_hint"] == "transfer":
             continue
+        if is_profit_payment(db, oid):
+            continue
         if db.execute("SELECT 1 FROM allocations WHERE operation=?", (oid,)).fetchone() or db.execute(
             "SELECT 1 FROM transfers WHERE outgoing=? OR incoming=?", (oid, oid)
         ).fetchone():
@@ -461,6 +479,41 @@ def add_profit_decision(db, payload, actor):
     return decision
 
 
+def profit_decision_rows(db, decision=None):
+    where, params = ("", ()) if decision is None else ("WHERE d.id=?", (decision,))
+    return [dict(row) for row in db.execute(f"""
+        SELECT d.*, COALESCE(SUM(-o.amount),0) AS paid
+        FROM profit_decisions d LEFT JOIN profit_payments p ON p.decision=d.id
+        LEFT JOIN operations o ON o.id=p.operation
+        {where} GROUP BY d.id
+    """, params)]
+
+
+def link_profit_payment(db, decision, operation):
+    rows = profit_decision_rows(db, decision)
+    if not rows or rows[0]["canceled"] or rows[0]["fund"] is not None:
+        raise ValueError("Выберите действующее решение о выплате собственникам.")
+    item = rows[0]
+    old = db.execute("SELECT decision FROM profit_payments WHERE operation=?", (operation,)).fetchone()
+    if old:
+        if old["decision"] == decision:
+            return False
+        raise ValueError("Списание уже связано с другим решением.")
+    op = payer_debit(db, operation, item["entity"])
+    if db.execute("SELECT 1 FROM transfers WHERE outgoing=?", (operation,)).fetchone():
+        raise ValueError("Списание связано с внутренним переводом.")
+    if db.execute("SELECT 1 FROM request_payments WHERE operation=?", (operation,)).fetchone():
+        raise ValueError("Списание уже связано с заявкой.")
+    if op["document_pending"] or db.execute(
+        "SELECT 1 FROM allocations WHERE operation=? AND article<>'Дивиденды'", (operation,)
+    ).fetchone():
+        raise ValueError("Сначала проверьте статус документа или измените статью списания на «Дивиденды».")
+    if -op["amount"] > item["amount"] - item["paid"]:
+        raise ValueError("Списание превышает остаток к выплате.")
+    db.execute("INSERT INTO profit_payments VALUES(?,?)", (operation, decision))
+    return True
+
+
 def mutate(db, action, payload, actor, role):
     if role != "finance" and action != "request":
         raise PermissionError("Действие доступно финансисту.")
@@ -508,8 +561,21 @@ def mutate(db, action, payload, actor, role):
         target = f"{entity}:{period}:{project}"
     elif action == "profit-decision":
         target = str(add_profit_decision(db, payload, actor))
+    elif action == "link-profit-payment":
+        decision, operation = int(payload["decision"]), int(payload["operation"])
+        if not link_profit_payment(db, decision, operation):
+            return result
+        target = f"{decision}:{operation}"
+    elif action == "unlink-profit-payment":
+        operation = int(payload["operation"])
+        row = db.execute("DELETE FROM profit_payments WHERE operation=? RETURNING decision", (operation,)).fetchone()
+        if not row:
+            raise ValueError("Связь с выплатой не найдена.")
+        target = f'{row["decision"]}:{operation}'
     elif action == "cancel-profit-decision":
         target = str(int(payload["id"]))
+        if db.execute("SELECT 1 FROM profit_payments WHERE decision=?", (target,)).fetchone():
+            raise ValueError("Перед отменой решения отвяжите банковские списания.")
         decision = db.execute("""
             UPDATE profit_decisions SET canceled=1 WHERE id=? AND canceled=0 RETURNING fund
         """, (target,)).fetchone()
@@ -551,6 +617,8 @@ def mutate(db, action, payload, actor, role):
         target = str(oid)
     elif action == "transfer":
         outgoing, incoming = int(payload["outgoing"]), int(payload["incoming"])
+        if is_profit_payment(db, outgoing):
+            raise ValueError("Списание уже связано с выплатой собственникам.")
         out = db.execute("SELECT account,amount FROM operations WHERE id=?", (outgoing,)).fetchone()
         inc = db.execute("SELECT account,amount FROM operations WHERE id=?", (incoming,)).fetchone()
         if not out or not inc or not out["account"] or not inc["account"] or out["account"] == inc["account"] or out["amount"] >= 0 or out["amount"] != -inc["amount"]:
@@ -572,6 +640,8 @@ def mutate(db, action, payload, actor, role):
         target = str(result["imported"])
     elif action == "allocate":
         oid = int(payload["id"])
+        if is_profit_payment(db, oid):
+            raise ValueError("Сначала отвяжите списание от решения о выплате.")
         if db.execute("SELECT 1 FROM transfers WHERE outgoing=? OR incoming=?", (oid, oid)).fetchone():
             raise ValueError("Сначала разорвите связь внутреннего перевода.")
         op = db.execute("SELECT amount,account,party_key,document_pending FROM operations WHERE id=?", (oid,)).fetchone()
@@ -712,9 +782,10 @@ class Handler(BaseHTTPRequestHandler):
                 db.execute("BEGIN")
                 data = {table: [dict(row) for row in db.execute(f"SELECT * FROM {table}")]
                         for table in ("allocations", "plans", "accruals", "balances", "accounts", "account_balances", "statement_controls", "bank_statements", "transfers", "request_payments", "forecast_entries",
-                                      "funds", "fund_entries", "profit_decisions", "office_contributions") if role == "finance"}
+                                      "funds", "fund_entries", "profit_payments", "office_contributions") if role == "finance"}
                 if role == "finance":
                     data["operations"] = read_operation_rows(db)
+                    data["profit_decisions"] = profit_decision_rows(db)
                     data["budget_versions"] = [
                         {**dict(row), "rows": json.loads(row["rows"])}
                         for row in db.execute("SELECT * FROM budget_versions ORDER BY id DESC")

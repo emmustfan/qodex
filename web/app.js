@@ -41,8 +41,10 @@ const bankName = id => {
 const inEntity = id => !entity || Number(entity) === id;
 const inScope = id => inEntity(bank(id)?.entity) && (!account || Number(account) === id);
 const transferMap = () => new Map(data.transfers.flatMap(({outgoing,incoming}) => [[outgoing,incoming],[incoming,outgoing]]));
+const profitPaymentMap = () => new Map(data.profit_payments.map(row => [row.operation,row.decision]));
 
 function cashRows(includeTransfers = false) {
+  const paid = profitPaymentMap();
   const byOperation = Map.groupBy(data.allocations, row => row.operation);
   const paired = transferMap();
   const byId = new Map(data.operations.map(op => [op.id,op]));
@@ -54,7 +56,8 @@ function cashRows(includeTransfers = false) {
   }).flatMap(op => {
     const other = byId.get(paired.get(op.id));
     const article = !other ? 'Без распределения' : bank(other.account)?.entity === bank(op.account)?.entity ? 'Между счетами' : 'Между ООО';
-    const lines = byOperation.get(op.id) || [{amount:op.amount,project:'',article}];
+    const lines = paid.has(op.id) ? [{amount:op.amount,project:'',article:'Дивиденды'}]
+      : byOperation.get(op.id) || [{amount:op.amount,project:'',article}];
     return lines.map(row => ({...row, month:op.day.slice(0,7),day:op.day,account:op.account}));
   });
 }
@@ -105,24 +108,30 @@ function chart(rows) {
 
 function operationTable(compact = false) {
   const paired = transferMap();
+  const paid = profitPaymentMap();
   const byOperation = Map.groupBy(data.allocations, row => row.operation);
   const items = data.operations.filter(op => {
     if (!inScope(op.account)) return false;
     const lines = byOperation.get(op.id) || [];
     if (!compact && operationFilter === 'documents' && !op.document_pending) return false;
-    if (!compact && operationFilter === 'pending' && (lines.length || paired.has(op.id))) return false;
-    return op.day.startsWith(period) && (!project || lines.some(line => line.project === project));
+    if (!compact && operationFilter === 'pending' && (lines.length || paired.has(op.id) || paid.has(op.id))) return false;
+    return op.day.startsWith(period) && (!project || (!paid.has(op.id) && lines.some(line => line.project === project)));
   }).sort((a,b) => b.day.localeCompare(a.day) || b.id-a.id);
   const rows = (compact ? items.slice(0,5) : items).map(op => {
     const lines = (byOperation.get(op.id) || []).filter(line => !project || project === line.project);
     const amount = project ? totals(lines).net : op.amount;
+    const dividend = paid.get(op.id);
     const hint = [op.suggested_project,op.suggested_article].filter(Boolean).join(' · ');
-    const note = op.document_pending ? 'Ждём документ' : !lines.length && !paired.has(op.id)
+    const note = op.document_pending ? 'Ждём документ' : !lines.length && !paired.has(op.id) && !dividend
       ? op.bank_hint === 'transfer' ? 'Возможный перевод или депозит'
       : [op.bank_hint === 'advance' ? 'Возможный аванс' : '',hint ? 'Подсказка: ' + hint : ''].filter(Boolean).join(' · ') : '';
+    const category = dividend ? '<span class="pill">Дивиденды</span>' : paired.has(op.id) ? '<span class="pill">Внутренний перевод</span>'
+      : lines.length ? esc([...new Set(lines.map(line => line.project))].join(', ')) : '<span class="pill pending">Без распределения</span>';
+    const action = dividend ? button('Выплаты','profit-payments:' + dividend) : paired.has(op.id) ? button('Отвязать','unlink-transfer:' + op.id)
+      : button(lines.length ? 'Открыть' : 'Распределить','allocate:' + op.id);
     return `<tr><td>${esc(op.day)}</td><td class="wrap">${esc(op.description)}<small>${esc([op.counterparty,bankName(op.account)].filter(Boolean).join(' · '))}</small></td>
-      <td>${paired.has(op.id) ? '<span class="pill">Внутренний перевод</span>' : lines.length ? esc([...new Set(lines.map(line => line.project))].join(', ')) : '<span class="pill pending">Без распределения</span>'}${note ? `<small>${esc(note)}</small>` : ''}</td>
-      <td class="${sign(amount)}">${rub(amount)}</td><td>${paired.has(op.id) ? button('Отвязать','unlink-transfer:' + op.id) : button(lines.length ? 'Открыть' : 'Распределить','allocate:' + op.id)} ${!op.account ? button('Указать счёт','assign-account:' + op.id) : ''}</td></tr>`;
+      <td>${category}${note ? `<small>${esc(note)}</small>` : ''}</td>
+      <td class="${sign(amount)}">${rub(amount)}</td><td>${action} ${!op.account ? button('Указать счёт','assign-account:' + op.id) : ''}</td></tr>`;
   });
   return table(compact ? 'Последние операции' : 'Банковские операции',['Дата','Назначение','Проект','Сумма',''],rows,'Операций за выбранный месяц нет.',compact ? button('Все операции','view:operations') : '');
 }
@@ -269,26 +278,34 @@ function forecast() {
     + table('Операции, добавленные вручную',['Дата','ООО','Назначение','Сумма',''],items,'Ручных операций до конца периода нет.');
 }
 
-function payments(item) {
-  const linked = data.request_payments.filter(row => row.request === item.id);
-  const existing = linked.map(row => data.operations.find(op => op.id === row.operation));
-  const used = new Set(data.request_payments.map(row => row.operation));
+function payments(item, profit = false) {
+  const links = profit ? data.profit_payments : data.request_payments;
+  const key = profit ? 'decision' : 'request';
+  const existing = new Set(links.filter(row => row[key] === item.id).map(row => row.operation));
+  const used = new Set([...data.request_payments,...data.profit_payments].map(row => row.operation));
   const paired = transferMap();
+  const byOperation = Map.groupBy(data.allocations, row => row.operation);
   const candidates = data.operations.filter(op => {
     if (bank(op.account)?.entity !== item.entity || op.amount >= 0
       || -op.amount > outstanding(item) || used.has(op.id) || paired.has(op.id)) return false;
-    return data.allocations.filter(row => row.operation === op.id)
-      .every(row => row.project === item.project && row.article === item.article);
+    const lines = byOperation.get(op.id) || [];
+    return profit ? !op.document_pending && lines.every(row => row.article === 'Дивиденды')
+      : lines.every(row => row.project === item.project && row.article === item.article);
   }).sort((a,b) => b.day.localeCompare(a.day));
-  const summary = `<p class="subtitle">${esc(item.title)} · оплачено ${rub(item.paid)} · к оплате ${rub(outstanding(item))}</p>`;
+  const heading = profit ? 'Выплаты собственникам' : 'Оплаты по заявке';
+  const summary = `<p class="subtitle">${esc(profit ? item.note : item.title)} · оплачено ${rub(item.paid)} · остаток ${rub(outstanding(item))}</p>`;
   const describe = op => `${op.day} · ${bankName(op.account)} · ${rub(-op.amount)} · ${op.description}`;
-  const history = existing.length ? `<ul class="payment-list">${existing.map(op =>
+  const history = existing.size ? `<ul class="payment-list">${data.operations.filter(op => existing.has(op.id))
+    .sort((a,b) => a.day.localeCompare(b.day)).map(op =>
     `<li>${esc(describe(op))} <button class="button" type="button" data-detach="${op.id}">Отвязать</button></li>`).join('')}</ul>` : '';
-  const form = modal('Оплаты по заявке',summary + history + (candidates.length
-    ? selectField('Списание','operation',candidates.map(op => [op.id,describe(op)]))
-      + '<small>Связь учитывает полную сумму списания. Если статья ещё не задана, она берётся из заявки. Месяц БДР задаётся в операции.</small>'
+  const instructions = profit
+    ? 'В БДДС выплата отразится по банковской дате по статье «Дивиденды». Списание целиком относится к одному решению.'
+    : 'Связь учитывает полную сумму списания. Если статья ещё не задана, она берётся из заявки. Месяц БДР задаётся в операции.';
+  const action = profit ? 'profit-payment' : 'payment';
+  const form = modal(heading,summary + history + (candidates.length
+    ? selectField('Списание','operation',candidates.map(op => [op.id,describe(op)])) + `<small>${instructions}</small>`
     : '<p>Доступных списаний для привязки нет.</p>'),
-  values => api('link-payment',{request:item.id,operation:values.get('operation')}));
+  values => api('link-' + action,{[key]:item.id,operation:values.get('operation')}));
   const submit = form.querySelector('[type=submit]');
   submit.hidden = !candidates.length;
   submit.textContent = 'Привязать списание';
@@ -296,8 +313,8 @@ function payments(item) {
     const control = event.target.closest('[data-detach]');
     if (!control) return;
     dialog.close();
-    modal('Отвязать списание','<p>Сумма снова появится к оплате. Распределение банковской операции сохранится.</p>',
-      () => api('unlink-payment',{operation:control.dataset.detach}));
+    modal('Отвязать списание',`<p>${profit ? 'Остаток к выплате увеличится. Списание останется в выписке с его прежним разнесением.' : 'Сумма снова появится к оплате. Распределение банковской операции сохранится.'}</p>`,
+      () => api('unlink-' + action,{operation:control.dataset.detach}));
   });
 }
 
@@ -352,7 +369,9 @@ function distributionReport() {
   const decisions = data.profit_decisions.filter(row => row.month === period && inEntity(row.entity));
   const active = decisions.filter(row => !row.canceled);
   const funds = totals(active.filter(row => row.fund)).incoming;
-  const owners = totals(active.filter(row => !row.fund)).incoming;
+  const ownerDecisions = active.filter(row => !row.fund);
+  const owners = totals(ownerDecisions).incoming;
+  const ownerBalance = ownerDecisions.reduce((total,row) => total + outstanding(row),0);
   const remaining = result - funds - owners;
   const pnlRow = (name,amounts,transfer,summary = false) => `<tr class="${summary ? 'summary-row' : ''}">
     <td><strong>${esc(name)}</strong></td><td>${rub(amounts.incoming)}</td><td>${rub(amounts.outgoing)}</td>
@@ -365,9 +384,16 @@ function distributionReport() {
   rows.push(pnlRow('Офис',office,officeReceived),pnlRow('Итого',totals(fact),0,true));
   const decisionRows = [...decisions].sort((a,b) => b.day.localeCompare(a.day) || b.id-a.id).map(item => {
     const destination = item.fund ? data.funds.find(fund => fund.id === item.fund)?.name : 'Собственникам';
+    const payable = !item.fund && !item.canceled;
+    const balance = outstanding(item);
+    const status = item.canceled ? 'Отменено' : item.fund ? 'Направлено в фонд' : !balance ? 'Выплачено'
+      : item.paid ? 'Частично выплачено' : 'К выплате';
+    const actions = (payable ? button('Выплаты','profit-payments:' + item.id) : '')
+      + (!item.canceled && !item.paid ? ' ' + button('Отменить','cancel-profit-decision:' + item.id) : '');
     return `<tr><td>${esc(item.day)}</td><td>${esc(entityName(item.entity))}</td><td>${esc(destination)}</td>
       <td class="wrap">${esc(item.note)}<small>${esc(item.actor)}</small></td><td>${rub(item.amount)}</td>
-      <td>${item.canceled ? '<span class="pill pending">Отменено</span>' : button('Отменить','cancel-profit-decision:' + item.id)}</td></tr>`;
+      <td>${payable ? rub(item.paid) : '—'}</td><td>${payable ? rub(balance) : '—'}</td>
+      <td><span class="pill ${payable && balance ? 'pending' : ''}">${status}</span></td><td>${actions}</td></tr>`;
   });
   return header('Распределение прибыли','Результат по начислениям, вклад в офис и решения по прибыли',
     button('Вклад в офис','office-contribution') + button('+ Решение','profit-decision',true)) + entityPeriodFilters()
@@ -376,7 +402,8 @@ function distributionReport() {
       ${card('Результат после офиса',rub(result),'По начислениям БДР')}
       ${card('Остаток после решений',rub(remaining),remaining < 0 && funds + owners > 0 ? 'Решения превышают результат месяца' : `В фонды ${rub(funds)} · Собственникам ${rub(owners)}`)}</div>`
     + table('Проекты и офис',['Центр','Доходы','Расходы','Результат до вклада','Внутренний вклад','Результат после вклада'],rows)
-    + '<div class="calendar-gap"></div>' + table('Решения по прибыли',['Дата решения','ООО','Направление','Основание','Сумма',''],decisionRows);
+    + '<div class="calendar-gap"></div>' + table('Решения по прибыли',['Дата решения','ООО','Направление','Основание','Сумма','Выплачено','Остаток','Статус',''],
+      decisionRows,'За выбранный период решений нет.',`<small>Собственникам осталось выплатить ${rub(ownerBalance)}</small>`);
 }
 
 function accountReport() {
@@ -596,9 +623,10 @@ function statementImport() {
 function bankSuggestions() {
   const allocated = new Set(data.allocations.map(item => item.operation));
   const paired = transferMap();
+  const paid = profitPaymentMap();
   return data.operations.filter(op => inScope(op.account) && op.day.startsWith(period)
     && (!project || project === op.suggested_project) && op.suggested_project && op.suggested_article
-    && !allocated.has(op.id) && !paired.has(op.id));
+    && !allocated.has(op.id) && !paired.has(op.id) && !paid.has(op.id));
 }
 
 function confirmSuggestions() {
@@ -694,7 +722,8 @@ function doAction(action) {
   if (kind === 'transfer') {
     const paired = transferMap();
     const allocated = new Set(data.allocations.map(row => row.operation));
-    const available = data.operations.filter(op => op.account && !paired.has(op.id) && !allocated.has(op.id));
+    const paid = profitPaymentMap();
+    const available = data.operations.filter(op => op.account && !paired.has(op.id) && !allocated.has(op.id) && !paid.has(op.id));
     const candidates = available.filter(op => op.amount > 0);
     const signed = op => [op.id,`${op.day} · ${bankName(op.account)} · ${rub(op.amount)} · ${op.description}`];
     const outgoing = available.filter(op => op.amount < 0 && candidates.some(other => other.amount === -op.amount && other.account !== op.account));
@@ -732,6 +761,7 @@ function doAction(action) {
   if (kind === 'remove-forecast') modal('Удалить строку прогноза','<p>Операция будет исключена из ожидаемых движений.</p>',
     () => api(kind,{id:Number(arg)}));
   if (kind === 'payments') payments(data.requests.find(row => row.id === Number(arg)));
+  if (kind === 'profit-payments') payments(data.profit_decisions.find(row => row.id === Number(arg)),true);
   if (kind === 'reschedule') {
     const item = data.requests.find(row => row.id === Number(arg));
     modal('Перенести оплату',field('Новая дата оплаты','day','date',dueDate(item),'required'),
