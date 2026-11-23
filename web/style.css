@@ -18,9 +18,9 @@ dialog details table{margin-top:8px}
 .directory-grid{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1.45fr);gap:15px;align-items:start}
 .payer-field{padding:8px 10px;background:#f4f7f3;border-radius:8px;overflow-wrap:anywhere}
 .payer-field strong{font-size:14px}
-dialog:has(.receipt-split){width:min(920px,calc(100% - 24px))}
-.split.receipt-split{grid-template-columns:1.1fr 1.35fr .8fr 1fr 1.2fr auto}
-@media(max-width:760px){.directory-grid{grid-template-columns:1fr}.split.receipt-split{grid-template-columns:repeat(2,minmax(0,1fr))}}
+dialog:has(.allocation-split){width:min(920px,calc(100% - 24px))}
+.split.allocation-split{grid-template-columns:1.1fr 1.35fr .8fr 1fr 1.2fr auto}
+@media(max-width:760px){.directory-grid{grid-template-columns:1fr}.split.allocation-split{grid-template-columns:repeat(2,minmax(0,1fr))}}
 .pnl-stage-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:15px}
 .pnl-edit-row{display:grid;grid-template-columns:minmax(0,1fr) auto;align-items:center;gap:8px;margin-top:10px}
 .pnl-edit-row input{width:100%}
@@ -31,4 +31,12 @@ dialog:has(.receipt-split){width:min(920px,calc(100% - 24px))}
 .pnl-unmapped{background:#fbf4e3}
 #pnl-edit-error:not(:empty){margin-bottom:14px}
 .sr-only{position:absolute;width:1px;height:1px;padding:0;margin:-1px;overflow:hidden;clip-path:inset(50%);white-space:nowrap}
+.operation-search input{width:min(100%,360px)}
+#operationList th:first-child,.operation-check{width:42px;text-align:center;padding-inline:10px}
+#operationList input[type=checkbox],.batch-confirm input{accent-color:var(--green);width:16px;height:16px;margin:0;vertical-align:middle;cursor:pointer}
+#operationList input:disabled,#operationList button:disabled{opacity:.5;cursor:default}
+#operationList .button[hidden]{display:none}
+.operation-selected td{background:#eef5ed}
+dialog .batch-confirm{display:flex;align-items:center;gap:9px}
+.batch-confirm input{flex:none}
 @media(max-width:760px){.pnl-stage-grid{grid-template-columns:1fr}}

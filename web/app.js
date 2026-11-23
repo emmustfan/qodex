@@ -15,6 +15,9 @@ let scenario = 'Базовый';
 let version = '';
 let operationFilter = 'all';
 let operationDirection = '';
+let operationSearch = '';
+const selectedOperations = new Set();
+let batchLoading = false;
 let toastTimer;
 
 const esc = value => String(value ?? '').replace(/[&<>"']/g, char => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[char]));
@@ -124,15 +127,22 @@ function operationTable(compact = false) {
   const paired = transferMap();
   const paid = profitPaymentMap();
   const byOperation = Map.groupBy(data.allocations, row => row.operation);
+  const terms = operationSearch.toLocaleLowerCase('ru').trim().split(/\s+/).filter(Boolean);
   const items = data.operations.filter(op => {
     if (!inScope(op.account) || (!compact && !matchesDirection(op))) return false;
     const lines = byOperation.get(op.id) || [];
     if (!compact && operationFilter === 'documents' && !op.document_pending) return false;
     if (!compact && operationFilter === 'pending' && (lines.length || paired.has(op.id) || paid.has(op.id))) return false;
-    return op.day.startsWith(period) && (!project || (!paid.has(op.id) && lines.some(line => line.project === project)));
+    if (!op.day.startsWith(period) || (project && (paid.has(op.id) || !lines.some(line => line.project === project)))) return false;
+    if (compact || !terms.length) return true;
+    const searchable = [op.description,op.counterparty,op.payer_label,clientName(op.client || op.suggested_client)]
+      .join(' ').toLocaleLowerCase('ru');
+    return terms.every(term => searchable.includes(term));
   }).sort((a,b) => b.day.localeCompare(a.day) || b.id-a.id);
+  const linked = compact ? null : new Set([...data.request_payments,...data.accrual_schedule_payments].map(row => row.operation));
   const rows = (compact ? items.slice(0,5) : items).map(op => {
-    const lines = (byOperation.get(op.id) || []).filter(line => !project || project === line.project);
+    const allLines = byOperation.get(op.id) || [];
+    const lines = allLines.filter(line => !project || project === line.project);
     const amount = project ? totals(lines).net : op.amount;
     const dividend = paid.get(op.id);
     const hint = [op.suggested_project,op.suggested_article].filter(Boolean).join(' · ');
@@ -149,11 +159,101 @@ function operationTable(compact = false) {
     const clientLabel = client ? 'Клиент: ' + client : hintedClient ? 'Подсказка: ' + hintedClient : '';
     const action = dividend ? button('Выплаты','profit-payments:' + dividend) : paired.has(op.id) ? button('Отвязать','unlink-transfer:' + op.id)
       : button(lines.length ? 'Открыть' : 'Распределить','allocate:' + op.id);
-    return `<tr><td>${esc(op.day)}</td><td class="wrap">${esc(op.description)}<small>${esc([payer,bankName(op.account)].filter(Boolean).join(' · '))}</small>${clientLabel ? `<small>${esc(clientLabel)}</small>` : ''}</td>
+    const selection = compact ? '' : operationCheckbox(op,allLines,linked.has(op.id) || paired.has(op.id) || paid.has(op.id));
+    return `<tr>${selection}<td>${esc(op.day)}</td><td class="wrap">${esc(op.description)}<small>${esc([payer,bankName(op.account)].filter(Boolean).join(' · '))}</small>${clientLabel ? `<small>${esc(clientLabel)}</small>` : ''}</td>
       <td>${category}${articles && !dividend ? `<small>${esc(articles)}</small>` : ''}${note ? `<small>${esc(note)}</small>` : ''}</td>
       <td class="${sign(amount)}">${rub(amount)}</td><td>${action} ${schedule ? button('Оплаты по графику','schedule-payments:' + schedule) : ''} ${!op.account ? button('Указать счёт','assign-account:' + op.id) : ''}</td></tr>`;
   });
-  return table(compact ? 'Последние операции' : 'Банковские операции',['Дата','Назначение, плательщик и клиент','Проект и статья','Сумма',''],rows,'Операций за выбранный месяц нет.',compact ? button('Все операции','view:operations') : '');
+  const headings = ['Дата','Назначение, плательщик и клиент','Проект и статья','Сумма',''];
+  if (!compact) headings.unshift('<input type="checkbox" id="selectVisibleOperations" aria-label="Выбрать все видимые операции" title="Выбрать все видимые операции">');
+  const actions = compact ? button('Все операции','view:operations') : `<div class="actions">
+    <small id="batchStatus" aria-live="polite"></small>${button('Снять выделение','clear-batch')}${button('Распределить выбранные','batch-allocate',true)}</div>`;
+  return table(compact ? 'Последние операции' : 'Банковские операции',headings,rows,
+    compact ? 'Операций за выбранный месяц нет.' : 'По выбранным фильтрам операций нет.',actions);
+}
+
+function operationCheckbox(op, lines, linked) {
+  const legal = bank(op.account)?.entity;
+  const locked = data.periodClosures.some(row => (!legal || row.entity === legal)
+    && (op.day.startsWith(row.month) || lines.some(line => line.accrual === row.month)));
+  const reason = linked ? 'Связанная операция распределяется отдельно' : locked ? 'Период закрыт' : '';
+  const label = reason || `Выбрать операцию: ${op.description || op.day}, ${rub(op.amount)}`;
+  return `<td class="operation-check" ${reason ? `title="${esc(reason)}"` : ''}><input type="checkbox" data-select-operation="${op.id}"
+    data-direction="${op.amount > 0 ? 'income' : 'expense'}" aria-label="${esc(label)}" ${reason ? 'disabled' : ''}></td>`;
+}
+
+function updateOperationSelection() {
+  const eligible = [...content.querySelectorAll('[data-select-operation]:enabled')];
+  const visible = new Set(eligible.map(input => Number(input.dataset.selectOperation)));
+  for (const id of selectedOperations) if (!visible.has(id)) selectedOperations.delete(id);
+  const directions = new Set();
+  for (const input of eligible) {
+    input.checked = selectedOperations.has(Number(input.dataset.selectOperation));
+    input.closest('tr').classList.toggle('operation-selected',input.checked);
+    if (input.checked) directions.add(input.dataset.direction);
+  }
+  const count = selectedOperations.size;
+  const master = content.querySelector('#selectVisibleOperations');
+  if (master) {
+    master.disabled = !eligible.length;
+    master.checked = count > 0 && count === eligible.length;
+    master.indeterminate = count > 0 && !master.checked;
+  }
+  const message = directions.size > 1 ? 'Выберите только поступления или только расходы.'
+    : count > 2000 ? 'За один раз можно распределить до 2 000 операций.' : '';
+  content.querySelector('#batchStatus').textContent = count ? `Выбрано ${count}. ${message}`.trim() : '';
+  content.querySelector('[data-action="batch-allocate"]').disabled = !count || Boolean(message) || batchLoading;
+  content.querySelector('[data-action="clear-batch"]').hidden = !count;
+}
+
+function renderOperationList() {
+  content.querySelector('#operationList').innerHTML = operationTable();
+  updateOperationSelection();
+}
+
+async function openBatchAllocation() {
+  const ids = [...selectedOperations];
+  batchLoading = true;
+  updateOperationSelection();
+  try {
+    const preview = await api('preview-batch-allocation',{ids});
+    if (view !== 'operations' || dialog.open || ids.length !== selectedOperations.size || ids.some(id => !selectedOperations.has(id))) return;
+    const direction = preview.amount > 0 ? 'income' : 'expense';
+    const choices = items => [['','Выберите'],...items.map(name => [name,name])];
+    const projects = activeProjects();
+    const form = modal('Распределить выбранные операции',
+      `<p>${direction === 'income' ? 'Поступления' : 'Расходы'} · ${preview.count} · ${rub(Math.abs(preview.amount))}</p>
+      <div class="fields">${selectField('Проект','project',choices(projects),projects.includes(project) ? project : '')}
+      ${selectField('Статья БДДС','article',choices(articlesFor(direction)))}</div>
+      <small>Проект и статья БДДС применяются ко всей сумме каждой операции.</small>
+      ${preview.allocated ? `<label class="batch-confirm"><input type="checkbox" name="replace" required>
+        Подтверждаю замену проекта и статьи у уже распределённых операций (${preview.allocated}).</label>` : ''}
+      ${preview.pending ? '<small>В выборке есть операции, по которым ждут документы. Существующие начисления сохранятся.</small>' :
+        `<div class="fields">${field('Общий месяц БДР','accrual','month')}
+          <div id="batchPnlArticle" hidden>${selectField('Статья БДР','accrualArticle',choices(articlesFor(direction,true)))}</div></div>
+        <small>Оставьте месяц пустым, чтобы сохранить существующие начисления. Если указать месяц, он и статья БДР заменят начисления для всех выбранных операций.</small>`}
+      <small>Операции без начислений при пустом месяце попадут только в БДДС.</small>`,
+      async values => {
+        const result = await api('batch-allocate',{...Object.fromEntries(values),ids,snapshot:preview.snapshot,replace:values.has('replace')});
+        selectedOperations.clear();
+        return `Распределено операций: ${result.applied}.`;
+      });
+    if (form.elements.accrual) {
+      const update = () => {
+        const enabled = Boolean(form.elements.accrual.value);
+        form.querySelector('#batchPnlArticle').hidden = !enabled;
+        form.elements.accrualArticle.disabled = !enabled;
+      };
+      form.elements.accrual.addEventListener('input',update);
+      update();
+    }
+    form.querySelector('[type=submit]').textContent = 'Распределить';
+  } catch (error) {
+    notify(error.message);
+  } finally {
+    batchLoading = false;
+    if (view === 'operations') updateOperationSelection();
+  }
 }
 
 function overview() {
@@ -561,7 +661,10 @@ function render() {
     const count = bankSuggestions().length;
     const suggestion = count ? button(`Подсказки (${count})`,'bank-suggestions') : '';
     content.innerHTML = header('Операции','Банковская выписка и распределение по проектам',
-      suggestion + button('Связать перевод','transfer') + button('↑ Импорт выписки','import',true)) + filters(false,true) + operationTable();
+      suggestion + button('Связать перевод','transfer') + button('↑ Импорт выписки','import',true)) + filters(false,true)
+      + `<div class="toolbar operation-search"><input type="search" id="operationSearch" aria-label="Поиск по назначению, контрагенту или клиенту"
+        placeholder="Назначение, контрагент или клиент" value="${esc(operationSearch)}"></div><div id="operationList"></div>`;
+    renderOperationList();
   }
   if (view === 'cash') content.innerHTML = report('БДДС');
   if (view === 'profit') content.innerHTML = report('БДР');
@@ -630,10 +733,10 @@ function allocation(op) {
     [['','Выберите статью'],...articles.map(name => [name,name])],selected);
   const profitArticle = (selected) => selectField('Статья БДР','accrualArticle',
     [['','По умолчанию'],...[...new Set([...articlesFor(direction,true),...previous.map(row => row.accrual_article).filter(Boolean)])].map(name => [name,name])],selected,false);
-  const makeRow = (line = {}) => `<div class="split ${incoming ? 'receipt-split' : ''}">
+  const makeRow = (line = {}) => `<div class="split allocation-split">
     ${selectField('Проект','project',[['','Выберите проект'],...activeProjects(previous.map(row => row.project)).map(name => [name,name])],line.project ?? '')}
     ${cashArticle(line.article)}${field('Сумма, ₽','amount','number',line.amount == null ? '' : line.amount / 100,'step="0.01" required')}
-    ${field('Месяц БДР','accrual','month',line.accrual || '')}${incoming ? profitArticle(line.accrual_article) : ''}
+    ${field('Месяц БДР','accrual','month',line.accrual || '')}${profitArticle(line.accrual_article)}
     <button type="button" class="button remove" aria-label="Удалить строку">×</button></div>`;
   const initial = {amount:op.amount,project:op.suggested_project ?? project,
     article:op.suggested_article ?? (fromBank ? '' : incoming ? '' : 'Разработка'),
@@ -707,6 +810,8 @@ function showStatementResult(result) {
   if (result.entity) entity = String(result.entity);
   operationFilter = 'all';
   operationDirection = '';
+  operationSearch = '';
+  selectedOperations.clear();
   return `Добавлено операций: ${result.new ?? result.imported}. Повторов: ${result.duplicates}.`;
 }
 
@@ -822,6 +927,7 @@ function doAction(action) {
   const [kind,arg] = action.split(':');
   if (handlePnlAction(kind,arg) || handleScheduleAction(kind,arg) || releaseAction(kind,arg) || workspaceAction(kind,arg)) return;
   if (kind === 'view') {
+    if (view === 'operations' && arg !== view) selectedOperations.clear();
     view = arg;
     version = '';
     render();
@@ -837,6 +943,11 @@ function doAction(action) {
     + selectField('Направление','direction',[['income','Поступления'],['expense','Расходы']]));
   if (kind === 'client') save('Новый клиент',field('Название клиента','name','text','','maxlength="100" required'));
   if (kind === 'allocate') allocation(data.operations.find(op => op.id === Number(arg)));
+  if (kind === 'batch-allocate') openBatchAllocation();
+  if (kind === 'clear-batch') {
+    selectedOperations.clear();
+    updateOperationSelection();
+  }
   if (kind === 'fund') save('Новый фонд',selectField('ООО','entity',legalOptions(),entity)
     + field('Название фонда','name','text','','maxlength="80" required'));
   if (kind === 'fund-entry') {
@@ -969,6 +1080,23 @@ document.addEventListener('click',event => {
 
 content.addEventListener('change',event => {
   const {id,value} = event.target;
+  if (id === 'selectVisibleOperations') {
+    selectedOperations.clear();
+    if (event.target.checked) {
+      for (const input of content.querySelectorAll('[data-select-operation]:enabled')) {
+        selectedOperations.add(Number(input.dataset.selectOperation));
+      }
+    }
+    updateOperationSelection();
+    return;
+  }
+  if (event.target.hasAttribute('data-select-operation')) {
+    const operation = Number(event.target.dataset.selectOperation);
+    if (event.target.checked) selectedOperations.add(operation);
+    else selectedOperations.delete(operation);
+    updateOperationSelection();
+    return;
+  }
   if (id === 'period' && value) period = value;
   if (id === 'project') project = value;
   if (id === 'entity') {
@@ -982,6 +1110,12 @@ content.addEventListener('change',event => {
   if (id === 'operationFilter') operationFilter = value;
   if (id === 'operationDirection') operationDirection = value;
   if (['period','project','scenario','operationFilter','operationDirection','entity','bankAccount','version'].includes(id)) render();
+});
+
+content.addEventListener('input',event => {
+  if (event.target.id !== 'operationSearch') return;
+  operationSearch = event.target.value;
+  renderOperationList();
 });
 
 api('state').then(state => {

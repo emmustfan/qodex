@@ -115,6 +115,7 @@ def init():
           operation INTEGER NOT NULL REFERENCES operations(id), project TEXT NOT NULL,
           article TEXT NOT NULL, amount INTEGER NOT NULL, accrual TEXT
         );
+        CREATE INDEX IF NOT EXISTS allocations_operation ON allocations(operation);
         CREATE TABLE IF NOT EXISTS plans (
           id INTEGER PRIMARY KEY, month TEXT NOT NULL, project TEXT NOT NULL,
           article TEXT NOT NULL, amount INTEGER NOT NULL, basis TEXT NOT NULL, scenario TEXT NOT NULL
@@ -592,6 +593,85 @@ def apply_bank_suggestions(db, ids):
     return count
 
 
+def batch_allocation(db, payload, save=False):
+    ids = payload.get("ids")
+    if not isinstance(ids, list) or not 1 <= len(ids) <= 2000:
+        raise ValueError("Выберите от 1 до 2 000 операций.")
+    if any(type(oid) is not int or not 0 < oid < 2**63 for oid in ids) or len(set(ids)) != len(ids):
+        raise ValueError("Проверьте список выбранных операций.")
+    placeholders = ",".join("?" for _ in ids)
+    operations = db.execute(f"""
+        SELECT o.id,o.ref,o.amount,o.day,o.account,o.document_pending,a.entity,
+          EXISTS(SELECT 1 FROM transfers t WHERE t.outgoing=o.id OR t.incoming=o.id)
+          OR EXISTS(SELECT 1 FROM profit_payments p WHERE p.operation=o.id)
+          OR EXISTS(SELECT 1 FROM request_payments p WHERE p.operation=o.id)
+          OR EXISTS(SELECT 1 FROM accrual_schedule_payments p WHERE p.operation=o.id) AS linked,
+          EXISTS(SELECT 1 FROM period_closures c WHERE (a.entity IS NULL OR c.entity=a.entity)
+            AND (c.month=substr(o.day,1,7) OR EXISTS(SELECT 1 FROM allocations l
+              WHERE l.operation=o.id AND l.accrual=c.month))) AS locked
+        FROM operations o LEFT JOIN accounts a ON a.id=o.account
+        WHERE o.id IN ({placeholders}) ORDER BY o.id
+    """, ids).fetchall()
+    if len(operations) != len(ids):
+        raise ValueError("Некоторые операции уже недоступны. Обновите список и выберите их заново.")
+    first_amount = operations[0]["amount"]
+    if any(row["amount"] * first_amount <= 0 for row in operations):
+        raise ValueError("Выберите только поступления или только расходы.")
+    if any(row["linked"] for row in operations):
+        raise ValueError("Операции, связанные с переводом, выплатой прибыли, заявкой или графиком, распределяются отдельно.")
+    if any(row["locked"] for row in operations):
+        raise sqlite3.IntegrityError(period_close.LOCK_MESSAGE)
+
+    previous = db.execute(f"""
+        SELECT operation,project,article,amount,accrual,accrual_article FROM allocations
+        WHERE operation IN ({placeholders}) ORDER BY operation,rowid
+    """, ids).fetchall()
+    by_operation = {}
+    for row in previous:
+        by_operation.setdefault(row["operation"], []).append(row)
+    snapshot = bank_hash([[tuple(row) for row in operations], [tuple(row) for row in previous]])
+    amount = sum(row["amount"] for row in operations)
+    if not save:
+        return {"count": len(operations), "amount": amount, "allocated": len(by_operation),
+                "pending": sum(bool(row["document_pending"]) for row in operations), "snapshot": snapshot}
+    if payload.get("snapshot") != snapshot:
+        raise ValueError("Данные операций изменились. Откройте распределение выбранных заново.")
+    if by_operation and payload.get("replace") is not True:
+        raise ValueError("Подтвердите замену проекта и статьи у уже распределённых операций.")
+
+    project, article = payload["project"], payload["article"]
+    ensure_project(db, project)
+    ensure_article(db, article, amount)
+    accrual = month(payload["accrual"]) if payload.get("accrual") else None
+    accrual_article = payload.get("accrualArticle") if accrual else None
+    if accrual:
+        if any(row["document_pending"] for row in operations):
+            raise ValueError("Для операций, по которым ждут документы, оставьте месяц БДР пустым.")
+        ensure_article(db, accrual_article, amount, accrual=True)
+
+    rows = []
+    for operation in operations:
+        oid = operation["id"]
+        lines = by_operation.get(oid, [])
+        amounts = {}
+        if accrual or not lines:
+            amounts[(accrual, accrual_article)] = operation["amount"]
+        else:
+            for line in lines:
+                existing_month = line["accrual"] if line["article"] not in NON_OPERATING else None
+                existing_article = (line["accrual_article"] or line["article"]) if existing_month else None
+                key = (existing_month, existing_article)
+                amounts[key] = amounts.get(key, 0) + line["amount"]
+        if article in NON_OPERATING and any(period is not None for period, _ in amounts):
+            raise ValueError("Для операций с месяцем БДР выберите статью операционной деятельности.")
+        rows.extend((oid, project, article, value, period, pnl_article)
+                    for (period, pnl_article), value in amounts.items())
+
+    db.execute(f"DELETE FROM allocations WHERE operation IN ({placeholders})", ids)
+    db.executemany("INSERT INTO allocations(operation,project,article,amount,accrual,accrual_article) VALUES(?,?,?,?,?,?)", rows)
+    return {"applied": len(operations)}
+
+
 def fund_id(db, value, entity=None):
     fund = int(value)
     row = db.execute("SELECT entity FROM funds WHERE id=?", (fund,)).fetchone()
@@ -871,6 +951,11 @@ def mutate(db, action, payload, actor, role):
     elif action == "apply-bank-suggestions":
         result["applied"] = apply_bank_suggestions(db, payload["ids"])
         target = str(result["applied"])
+    elif action == "preview-batch-allocation":
+        return batch_allocation(db, payload)
+    elif action == "batch-allocate":
+        result = batch_allocation(db, payload, save=True)
+        target = ",".join(map(str, sorted(payload["ids"])))
     elif action in ("preview-close", "close-period", "reopen-period"):
         entity, period = entity_id(payload), month(payload["month"])
         if action == "preview-close":
