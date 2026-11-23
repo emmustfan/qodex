@@ -1,0 +1,21 @@
+{$QODEX_DOMAIN} {
+	encode zstd gzip
+	handle /oauth2/* {
+		reverse_proxy auth:4180
+	}
+	handle {
+		request_header -X-Qodex-User
+		forward_auth auth:4180 {
+			uri /oauth2/auth
+			copy_headers X-Auth-Request-Email>X-Qodex-User
+			@unauthorized status 401
+			handle_response @unauthorized {
+				redir /oauth2/start?rd=/ 302
+			}
+		}
+		reverse_proxy qodex:8000 {
+			header_up X-Qodex-Proxy-Token {$QODEX_PROXY_TOKEN}
+			header_up -Authorization
+		}
+	}
+}

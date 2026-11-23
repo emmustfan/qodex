@@ -3,7 +3,7 @@ const dialog = document.querySelector('#dialog');
 const nav = document.querySelector('#nav');
 const RUB = new Intl.NumberFormat('ru-RU', {style:'currency',currency:'RUB',maximumFractionDigits:2,minimumFractionDigits:0});
 const MONTHS = ['янв','фев','мар','апр','май','июн','июл','авг','сен','окт','ноя','дек'];
-const tabs = [['overview','▦','Обзор'],['operations','⇄','Операции'],['cash','▤','БДДС'],['calendar','▧','Платёжный календарь'],['forecast','↗','Прогноз денег'],['profit','▥','БДР / P&L'],['schedules','▦','Графики начислений'],['distribution','∑','Распределение прибыли'],['funds','◈','Фонды'],['requests','✓','Заявки'],['accounts','▱','Счета'],['directories','▤','Справочники']];
+const tabs = [['overview','▦','Обзор'],['operations','⇄','Операции'],['cash','▤','БДДС'],['calendar','▧','Платёжный календарь'],['forecast','↗','Прогноз денег'],['profit','▥','БДР / P&L'],['schedules','▦','Графики начислений'],['distribution','∑','Распределение прибыли'],['funds','◈','Фонды'],['requests','✓','Заявки'],['accounts','▱','Счета'],['periods','⊡','Закрытие месяца'],['directories','▤','Справочники']];
 const nonOperating = ['Финансирование','Дивиденды'];
 let data;
 let view = 'overview';
@@ -185,7 +185,7 @@ function report(basis) {
     const actual = totals(fact);
     const rows = [...new Set(fact.map(row => row.article))].map(article =>
       `<tr><td>${esc(article)}</td><td>${rub(totals(fact.filter(row => row.article === article)).net)}</td></tr>`);
-    return header('БДДС',esc(bankName(Number(account))) + ' · факт по датам платежей') + filters()
+    return header('БДДС',esc(bankName(Number(account))) + ' · факт по датам платежей',button('Экспорт Excel','export-report')) + filters() + closeBadge()
       + `<div class="metrics">${card('Чистый денежный поток',rub(actual.net),'Факт за месяц')}${card('Поступления',rub(actual.incoming),'Факт за месяц')}${card('Выплаты',rub(actual.outgoing),'Факт за месяц')}</div>`
       + table('Движение по статьям',['Статья','Факт'],rows);
   }
@@ -211,7 +211,7 @@ function report(basis) {
     return `<tr><td>${esc(article)}</td><td>${rub(plannedAmount)}</td><td>${rub(actualAmount)}</td><td class="${sign(actualAmount-plannedAmount)}">${rub(actualAmount-plannedAmount)}</td></tr>`;
   });
   const extras = cash ? '' : table('Подтверждённые начисления',['Период','Проект','Описание','Сумма'],filterRows(data.accruals.filter(row => inEntity(row.entity))).map(item => `<tr><td>${esc(item.month)}</td><td>${esc(item.project)}</td><td class="wrap">${esc(item.description)}</td><td>${rub(item.amount)}</td></tr>`));
-  return header(cash ? 'БДДС' : 'БДР / P&L',cash ? 'План и факт по датам платежей' : 'План и факт по месяцам начисления',planActions + (cash ? '' : button('+ Начисление','accrual') + button('Распределение прибыли','view:distribution') + button('Графики начислений','view:schedules') + switchView)) + filters(true,false,cash) + versionFilter
+  return header(cash ? 'БДДС' : 'БДР / P&L',cash ? 'План и факт по датам платежей' : 'План и факт по месяцам начисления',planActions + (cash ? '' : button('+ Начисление','accrual') + button('Распределение прибыли','view:distribution') + button('Графики начислений','view:schedules') + switchView) + button('Экспорт Excel','export-report')) + filters(true,false,cash) + versionFilter + closeBadge()
     + `<div class="metrics">${card(cash ? 'Чистый денежный поток' : 'Операционный результат',rub(actual.net),`План ${rub(planned.net)}`)}${card(cash ? 'Поступления' : 'Доходы',rub(actual.incoming),`План ${rub(planned.incoming)}`)}${card(cash ? 'Выплаты' : 'Расходы',rub(actual.outgoing),`План ${rub(planned.outgoing)}`)}${cash ? card('Отклонение потока',rub(actual.net-planned.net),'Факт минус план') : card('Маржа проектов',pnlPercent(structure.margin),`Офисные расходы · ${rub(office.outgoing)}`)}</div>`
     + (display === 'structure' ? structure.html : table('План-факт по статьям',['Статья','План','Факт','Отклонение'],rows))
     + (extras ? '<div class="calendar-gap"></div>' + extras : '');
@@ -226,18 +226,24 @@ function paymentStatus(item) {
 }
 
 function requestActions(item) {
-  if (!finance()) return '';
-  if (item.status === 'На согласовании' && (data.demo || item.author !== data.user)) {
-    return button('Решение','review:' + item.id);
-  }
-  return item.status === 'Согласована' ? button('Оплаты','payments:' + item.id) : '';
+  if (item.canReview) return button('Решение','review:' + item.id);
+  return finance() && item.status === 'Согласована' ? button('Оплаты','payments:' + item.id) : '';
 }
 
 function requests() {
-  const rows = [...data.requests].sort((a,b) => b.id-a.id).map(item =>
-    `<tr><td class="wrap"><strong>${esc(item.title)}</strong><small>${esc(item.author)}</small></td><td>${esc(item.project)}</td><td>${esc(item.article)}</td><td>${esc(entityName(item.entity))}</td><td>${esc(dueDate(item))}</td><td>${rub(item.amount)}</td><td>${rub(item.paid)}</td><td><span class="pill ${item.status === 'На согласовании' ? 'pending' : ''}">${paymentStatus(item)}</span></td><td>${requestActions(item)}</td></tr>`);
-  return header('Заявки на расходы','Согласованные заявки попадают в базовый план БДДС.',button('+ Новая заявка','request',true))
-    + table(finance() ? 'Все заявки' : 'Мои заявки',['Назначение','Проект','Статья','ООО','Дата оплаты','Сумма','Оплачено','Статус',''],rows,'Заявок пока нет.');
+  const unread = data.requestAlerts.filter(item => !item.seen).length;
+  const rows = [...data.requests].sort((a,b) => b.id-a.id).map(item => `<tr>
+    <td class="wrap"><strong>${esc(item.title)}</strong><small>${esc(item.author)}</small></td><td>${esc(item.project)}</td>
+    <td>${esc(item.article)}</td><td>${esc(entityName(item.entity))}</td><td>${esc(dueDate(item))}</td>
+    <td>${rub(item.amount)}</td><td>${rub(item.paid)}</td>
+    <td><span class="pill ${item.status === 'На согласовании' ? 'pending' : ''}">${paymentStatus(item)}</span>
+    ${item.status === 'На согласовании' ? `<small>${esc(item.route)}</small>` : ''}</td>
+    <td>${requestActions(item)} ${button('Обсуждение','thread-open:' + item.id)}</td></tr>`);
+  const actions = button('Обновить','release-refresh') + button(unread ? `Уведомления (${unread})` : 'Уведомления','request-alerts')
+    + (data.projects.length ? button('+ Новая заявка','request',true) : '');
+  return header('Заявки на расходы','Согласованные заявки попадают в базовый план БДДС.',actions)
+    + table(finance() ? 'Все заявки' : data.role === 'manager' ? 'Заявки моих проектов' : 'Мои заявки',
+      ['Назначение','Проект','Статья','ООО','Дата оплаты','Сумма','Оплачено','Статус',''],rows,'Заявок пока нет.');
 }
 
 function calendar() {
@@ -464,7 +470,7 @@ function distributionReport() {
       <td><span class="pill ${payable && balance ? 'pending' : ''}">${status}</span></td><td>${actions}</td></tr>`;
   });
   return header('Распределение прибыли','Результат по начислениям, вклад в офис и решения по прибыли',
-    button('Вклад в офис','office-contribution') + button('Распределить офис','office-distribution') + button('+ Решение','profit-decision',true)) + entityPeriodFilters()
+    button('Экспорт Excel','export-report') + button('Вклад в офис','office-contribution') + button('Распределить офис','office-distribution') + button('+ Решение','profit-decision',true)) + entityPeriodFilters()
     + `<div class="metrics">${card('Результат проектов',rub(projectTotal.net),'До вклада в офис')}
       ${card('Расходы офиса',rub(office.outgoing),`Вклад проектов ${rub(officeReceived)}`)}
       ${card('Результат после офиса',rub(result),'По начислениям БДР')}
@@ -531,19 +537,22 @@ function directories() {
       ...(receipts.get(item.id) || []).map(row => row.counterparty || row.payer_label).filter(Boolean)]);
     return `<tr><td>${esc(item.name)}</td><td class="wrap">${linkedPayers.size ? esc([...linkedPayers].join(', ')) : '—'}</td></tr>`;
   });
+  const companies = legalOptions().map(([id,label]) =>
+    `<tr><td>${esc(label)}</td><td>${button('Переименовать','rename-entity:' + id)}</td></tr>`);
   return header('Справочники','Проекты, статьи и основные клиенты')
     + '<div class="directory-grid">'
     + table('Проекты',['Название'],names,'Проектов пока нет.',button('+ Проект','project',true))
     + table('Клиенты',['Основной клиент','Плательщики из поступлений'],clients,'Добавьте клиента здесь или в карточке поступления.',button('+ Клиент','client',true))
     + '</div><div class="calendar-gap"></div>'
-    + table('Статьи',['Название','Направление'],articles,'Статей пока нет.',button('+ Статья','article',true));
+    + table('Статьи',['Название','Направление'],articles,'Статей пока нет.',button('+ Статья','article',true))
+    + '<div class="calendar-gap"></div>' + table('Юридические лица',['Название',''],companies);
 }
 
 function render() {
   if (!finance()) view = 'requests';
   if (view === 'profit' || view === 'pnl-template' || view === 'calendar') account = '';
   nav.innerHTML = '<p class="nav-label">РАЗДЕЛЫ</p>' + tabs.filter(([key]) => finance() || key === 'requests').map(([key,icon,text]) => `<button data-action="view:${key}" class="${view === key || (key === 'profit' && view === 'pnl-template') ? 'nav-active' : ''}" ${view === key || (key === 'profit' && view === 'pnl-template') ? 'aria-current="page"' : ''}><span class="nav-icon" aria-hidden="true">${icon}</span>${text}</button>`).join('');
-  document.querySelector('#account').innerHTML = `<span class="avatar" aria-hidden="true">${esc(data.user[0])}</span><div>${esc(data.user)}<small>${finance() ? 'Финансист' : 'Сотрудник'}</small></div>`;
+  document.querySelector('#account').innerHTML = `<span class="avatar" aria-hidden="true">${esc(data.user[0])}</span><div>${esc(data.user)}<small>${finance() ? 'Финансист' : data.role === 'manager' ? 'Руководитель проекта' : 'Сотрудник'}</small></div>`;
   if (view === 'overview') content.innerHTML = overview();
   if (view === 'operations') {
     const count = bankSuggestions().length;
@@ -562,6 +571,7 @@ function render() {
   if (view === 'funds') content.innerHTML = fundsReport();
   if (view === 'distribution') content.innerHTML = distributionReport();
   if (view === 'directories') content.innerHTML = directories();
+  if (view === 'periods') content.innerHTML = periodsReport();
 }
 
 const field = (label, name, type, value = '', extra = '') => `<label>${label}<input name="${name}" type="${type}" value="${esc(value)}" ${extra}></label>`;
@@ -803,11 +813,12 @@ function budgetEntry(kind,basis) {
 
 function doAction(action) {
   const [kind,arg] = action.split(':');
-  if (handlePnlAction(kind,arg) || handleScheduleAction(kind,arg)) return;
+  if (handlePnlAction(kind,arg) || handleScheduleAction(kind,arg) || releaseAction(kind,arg)) return;
   if (kind === 'view') {
     view = arg;
     version = '';
     render();
+    refreshView();
     return;
   }
   const defaultDate = period + '-01';
@@ -862,6 +873,9 @@ function doAction(action) {
   if (kind === 'cancel-profit-decision') modal('Отменить решение',
     '<p>Отмена исключит сумму из распределения прибыли. Для фонда остаток пересчитается с даты решения.</p>',
     () => api(kind,{id:Number(arg)}));
+  if (kind === 'rename-entity') modal('Название ООО',
+    field('Название','name','text',entityName(Number(arg)),'maxlength="100" required'),
+    values => api(kind,{entity:Number(arg),name:values.get('name')}));
   if (kind === 'account') save('Новый счёт',selectField('ООО','entity',legalOptions(),entity)
     + field('Название счёта','name','text','','maxlength="80" required'));
   if (kind === 'account-balance') {
@@ -931,7 +945,8 @@ function doAction(action) {
   }
   if (kind === 'review') {
     const item = data.requests.find(row => row.id === Number(arg));
-    modal('Решение по заявке',`<p class="subtitle">${esc(item.title)} · ${rub(item.amount)}</p>` + picker('Решение','status',['Согласована','Отклонена']),values => api('review',{id:item.id,status:values.get('status')}));
+    modal('Решение по заявке',`<p class="subtitle">${esc(item.title)} · ${rub(item.amount)}</p>` + picker('Решение','status',['Согласована','Отклонена'])
+      + field('Комментарий к решению','note','text','','maxlength="1000"'),values => api('review',{id:item.id,status:values.get('status'),note:values.get('note')}));
   }
 }
 

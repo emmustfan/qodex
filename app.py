@@ -11,14 +11,19 @@ from datetime import date
 from decimal import Decimal, InvalidOperation
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import urlsplit
+from urllib.parse import quote, urlsplit
 
 import bank_statement
 import pnl_template
+import period_close
+import pilot_access
+import report_export
 
 ROOT = Path(__file__).resolve().parent
 DB = Path(os.environ.get("QODEX_DB", ROOT / "data" / "finance.sqlite3"))
-USERS = json.loads(os.environ.get("QODEX_USERS", "{}"))
+USERS_FILE = os.environ.get("QODEX_USERS_FILE")
+USERS = json.loads(Path(USERS_FILE).read_text(encoding="utf-8") if USERS_FILE else os.environ.get("QODEX_USERS", "{}"))
+PROXY_TOKEN = os.environ.get("QODEX_PROXY_TOKEN", "")
 SEED_PROJECTS = ["Ро-бот", "Проект 2", "Проект 3", "Офис"]
 SEED_ARTICLES = ["Лицензии", "Услуги", "Разработка", "Дизайн", "Инфраструктура", "Продажи", "Офисные расходы", "Налоги", "Финансирование", "Дивиденды", "ФОТ", "Поддержка", "Прямые расходы на клиентов", "Банковские комиссии"]
 CASH_STAGES = ("Аванс от клиента", "Промежуточный платёж", "Окончательный расчёт")
@@ -64,6 +69,9 @@ def init():
         CREATE TABLE IF NOT EXISTS client_payers (
           party_key TEXT PRIMARY KEY, client INTEGER NOT NULL REFERENCES clients(id),
           payer TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS legal_entities (
+          id INTEGER PRIMARY KEY CHECK(id IN (1,2)), name TEXT NOT NULL UNIQUE
         );
         CREATE TABLE IF NOT EXISTS accounts (
           id INTEGER PRIMARY KEY, entity INTEGER NOT NULL CHECK(entity IN (1,2)),
@@ -179,6 +187,21 @@ def init():
           request INTEGER NOT NULL REFERENCES requests(id)
         );
         CREATE INDEX IF NOT EXISTS request_payments_request ON request_payments(request);
+        CREATE TABLE IF NOT EXISTS request_comments (
+          id INTEGER PRIMARY KEY, request INTEGER NOT NULL REFERENCES requests(id),
+          actor TEXT NOT NULL, body TEXT NOT NULL, created TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+        );
+        CREATE TABLE IF NOT EXISTS request_attachments (
+          id INTEGER PRIMARY KEY, request INTEGER NOT NULL REFERENCES requests(id),
+          actor TEXT NOT NULL, name TEXT NOT NULL, data BLOB NOT NULL,
+          created TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+        );
+        CREATE TABLE IF NOT EXISTS request_alerts (
+          id INTEGER PRIMARY KEY, request INTEGER NOT NULL REFERENCES requests(id),
+          recipient TEXT NOT NULL, body TEXT NOT NULL, seen INTEGER NOT NULL DEFAULT 0,
+          created TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+        );
+        CREATE INDEX IF NOT EXISTS request_alerts_recipient ON request_alerts(recipient,seen,id);
         CREATE TABLE IF NOT EXISTS audit (
           id INTEGER PRIMARY KEY, actor TEXT NOT NULL, action TEXT NOT NULL,
           target TEXT NOT NULL, created TEXT DEFAULT CURRENT_TIMESTAMP
@@ -204,6 +227,7 @@ def init():
             if column not in {row["name"] for row in db.execute(f"PRAGMA table_info({table})")}:
                 db.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
         db.execute("CREATE UNIQUE INDEX IF NOT EXISTS accrual_schedule_month ON accruals(schedule_month)")
+        db.executemany("INSERT OR IGNORE INTO legal_entities(id,name) VALUES(?,?)", enumerate(ENTITIES, 1))
         db.executemany("INSERT OR IGNORE INTO projects(name) VALUES(?)", [(name,) for name in SEED_PROJECTS])
         db.executemany("INSERT OR IGNORE INTO articles(name,direction) VALUES(?,?)", DEFAULT_ARTICLES.items())
         pnl_template.initialize(db, pnl_articles(DEFAULT_ARTICLES))
@@ -242,6 +266,8 @@ def init():
             db.executemany("INSERT INTO requests(title,author,day,project,article,amount,entity) VALUES(?,?,?,?,?,?,?)",
                            [("Дизайн личного кабинета", "Команда продукта", "2026-06-27", SEED_PROJECTS[0], SEED_ARTICLES[3], 8500000, 1),
                             ("Облачные ресурсы на июнь", "Техлид", "2026-06-29", SEED_PROJECTS[1], SEED_ARTICLES[4], 4200000, 2)])
+
+        period_close.install_locks(db)
 
 
 def money(value, allow_zero=False):
@@ -777,7 +803,9 @@ def distribute_office_costs(db, payload, save):
 
 
 def mutate(db, action, payload, actor, role):
-    if role != "finance" and action != "request":
+    if role != "finance" and action not in ("request", "request-comment", "request-attach", "request-alert-seen") and not (
+        role == "manager" and action == "review"
+    ):
         raise PermissionError("Действие доступно финансисту.")
     target = ""
     result = {}
@@ -789,6 +817,17 @@ def mutate(db, action, payload, actor, role):
     elif action == "apply-bank-suggestions":
         result["applied"] = apply_bank_suggestions(db, payload["ids"])
         target = str(result["applied"])
+    elif action in ("preview-close", "close-period", "reopen-period"):
+        entity, period = entity_id(payload), month(payload["month"])
+        if action == "preview-close":
+            return period_close.checklist(db, entity, period)
+        note = decision_note(payload["note"])
+        if action == "close-period":
+            period_close.close(db, entity, period, actor, note, payload.get("exceptions") is True,
+                               payload.get("expectedChecks"))
+        elif db.execute("DELETE FROM period_closures WHERE entity=? AND month=?", (entity, period)).rowcount != 1:
+            raise ValueError("Период уже открыт.")
+        target = f"{entity}:{period}:{note}"
     elif action == "preview-accrual-schedule":
         return accrual_schedule(db, payload, save=False)
     elif action == "accrual-schedule":
@@ -901,6 +940,16 @@ def mutate(db, action, payload, actor, role):
             raise ValueError("Действующее решение не найдено.")
         if decision["fund"] is not None:
             check_fund_balance(db, decision["fund"])
+    elif action == "rename-entity":
+        entity = entity_id(payload)
+        name = payload["name"].strip()
+        if not name or len(name) > 100 or any(
+            row["name"].casefold() == name.casefold()
+            for row in db.execute("SELECT name FROM legal_entities WHERE id<>?", (entity,))
+        ):
+            raise ValueError("Введите отличающееся название ООО до 100 символов.")
+        db.execute("UPDATE legal_entities SET name=? WHERE id=?", (name,entity))
+        target = f"{entity}:{name}"
     elif action == "account":
         name = payload["name"].strip()
         if not name or len(name) > 80:
@@ -1016,6 +1065,16 @@ def mutate(db, action, payload, actor, role):
             ensure_project(db, target)
         db.execute("INSERT INTO balances VALUES(?,?,?) ON CONFLICT(project) DO UPDATE SET day=excluded.day,amount=excluded.amount",
                    (target, day(payload["day"]), money(payload["amount"], allow_zero=True)))
+    elif action == "request-alert-seen":
+        db.execute("UPDATE request_alerts SET seen=1 WHERE recipient=?", (actor,))
+        return result
+    elif action in ("request-comment", "request-attach"):
+        request = pilot_access.request_for(db, payload["id"], actor, role, USERS)
+        if action == "request-comment":
+            pilot_access.add_comment(db, request["id"], actor, payload["body"])
+        else:
+            pilot_access.add_attachment(db, request["id"], actor, payload["name"], payload["file"])
+        target = str(request["id"])
     elif action in ("accrual", "plan", "request"):
         project, article = payload["project"], payload["article"]
         ensure_project(db, project)
@@ -1037,6 +1096,8 @@ def mutate(db, action, payload, actor, role):
                 INSERT INTO plans(month,project,article,amount,basis,scenario,entity) VALUES(?,?,?,?,?,?,?)
             """, (month(payload["month"]), project, article, amount, basis, scenario, entity_id(payload))).lastrowid)
         else:
+            if role == "manager" and project not in USERS.get(actor, {}).get("projects", []):
+                raise PermissionError("Выберите один из назначенных вам проектов.")
             ensure_article(db, article, -1)
             title = payload["title"].strip()
             if not title or len(title) > 200 or amount <= 0:
@@ -1081,18 +1142,32 @@ def mutate(db, action, payload, actor, role):
         if payload["status"] not in ("Согласована", "Отклонена"):
             raise ValueError("Неизвестное решение.")
         target = str(int(payload["id"]))
-        if USERS and db.execute("SELECT 1 FROM requests WHERE id=? AND author=?", (target, actor)).fetchone():
-            raise PermissionError("Заявку согласует другой финансист.")
-        if db.execute("UPDATE requests SET status=? WHERE id=? AND status='На согласовании'", (payload["status"], target)).rowcount != 1:
-            raise ValueError("Заявка уже обработана или не найдена.")
+        request = pilot_access.request_for(db, target, actor, role, USERS)
+        if request["status"] != "На согласовании":
+            raise ValueError("Заявка уже обработана.")
+        if not pilot_access.can_review(request, actor, role, USERS, money):
+            raise PermissionError("Заявку согласует другой пользователь с доступом к проекту и достаточным лимитом.")
+        db.execute("UPDATE requests SET status=? WHERE id=?", (payload["status"], target))
+        if payload.get("note", "").strip():
+            pilot_access.add_comment(db, request["id"], actor, payload["status"] + ". " + payload["note"].strip())
     else:
         raise ValueError("Неизвестное действие.")
+    if action in ("request", "review", "request-comment", "request-attach", "reschedule", "link-payment", "unlink-payment"):
+        request_id = int(target.split(":")[0])
+        request = db.execute("SELECT * FROM requests WHERE id=?", (request_id,)).fetchone()
+        pilot_access.notify_request(db, request, action, actor, USERS, money)
     db.execute("INSERT INTO audit(actor,action,target) VALUES(?,?,?)", (actor, action, target))
     return result
 
 
 class Handler(BaseHTTPRequestHandler):
     def identity(self):
+        if PROXY_TOKEN:
+            supplied = self.headers.get("X-Qodex-Proxy-Token", "")
+            actor = self.headers.get("X-Qodex-User", "")
+            if actor in USERS and hmac.compare_digest(PROXY_TOKEN.encode(), supplied.encode()):
+                return actor, USERS[actor]["role"]
+            return None
         if not USERS:
             return "Демо-пользователь", "finance"
         try:
@@ -1104,14 +1179,16 @@ class Handler(BaseHTTPRequestHandler):
             pass
         return None
 
-    def send_data(self, code, data, mime="application/json; charset=utf-8"):
+    def send_data(self, code, data, mime="application/json; charset=utf-8", filename=None):
         self.send_response(code)
         self.send_header("Content-Type", mime)
         self.send_header("Content-Length", str(len(data)))
         self.send_header("Cache-Control", "no-store")
         self.send_header("X-Content-Type-Options", "nosniff")
         self.send_header("Content-Security-Policy", "default-src 'self'; style-src 'self' 'unsafe-inline'; frame-ancestors 'none'")
-        if code == 401:
+        if filename:
+            self.send_header("Content-Disposition", "attachment; filename*=UTF-8''" + quote(filename, safe=""))
+        if code == 401 and not PROXY_TOKEN:
             self.send_header("WWW-Authenticate", 'Basic realm="Qodex", charset="UTF-8"')
         self.end_headers()
         self.wfile.write(data)
@@ -1124,6 +1201,19 @@ class Handler(BaseHTTPRequestHandler):
         if identity is None:
             return self.reply(401, {"error": "Требуется вход."})
         path = urlsplit(self.path).path
+        if path.startswith("/api/request-attachment/"):
+            parts = path.split("/")
+            if len(parts) != 4 or not parts[-1].isascii() or not parts[-1].isdigit() or len(parts[-1]) > 18:
+                return self.reply(404, {"error": "Файл не найден."})
+            with closing(connect()) as db:
+                row = db.execute("SELECT * FROM request_attachments WHERE id=?", (int(parts[-1]),)).fetchone()
+                try:
+                    if row is None:
+                        raise PermissionError()
+                    pilot_access.request_for(db, row["request"], *identity, USERS)
+                except PermissionError:
+                    return self.reply(404, {"error": "Файл не найден."})
+                return self.send_data(200, row["data"], "application/octet-stream", row["name"])
         if path == "/api/state":
             name, role = identity
             with closing(connect()) as db:
@@ -1137,6 +1227,11 @@ class Handler(BaseHTTPRequestHandler):
                     data["client_payers"] = [dict(row) for row in db.execute("SELECT DISTINCT client,payer FROM client_payers")]
                     data["profit_decisions"] = profit_decision_rows(db)
                     data["pnlTemplate"] = pnl_template.read(db)
+                    data["periodClosures"] = [
+                        {**dict(row), "checks": json.loads(row["checks"])}
+                        for row in db.execute("SELECT * FROM period_closures ORDER BY month DESC,entity")
+                    ]
+                    data["audit"] = [dict(row) for row in db.execute("SELECT * FROM audit ORDER BY id DESC LIMIT 300")]
                     data["officeDistributionRules"] = [
                         {**dict(row), "weights": json.loads(row["weights"])}
                         for row in db.execute("SELECT * FROM office_distribution_rules")
@@ -1145,14 +1240,33 @@ class Handler(BaseHTTPRequestHandler):
                         {**dict(row), "rows": json.loads(row["rows"])}
                         for row in db.execute("SELECT * FROM budget_versions ORDER BY id DESC")
                     ]
-                data["requests"] = request_rows(db, None if role == "finance" else name)
+                requests = request_rows(db, None if role in ("finance", "manager") else name)
+                data["requests"] = [
+                    {**row, "canReview": pilot_access.can_review(row, name, role, USERS, money),
+                     "route": "Руководитель проекта или финансист" if any(
+                         login != row["author"] and pilot_access.manager_matches(user, row, money)
+                         for login, user in USERS.items()) else "Финансист"}
+                    for row in requests if pilot_access.can_view(row, name, role, USERS)
+                ]
+                visible = {row["id"] for row in data["requests"]}
+                data["requestAlerts"] = [dict(row) for row in db.execute("""
+                    SELECT id,request,body,seen,created FROM request_alerts WHERE recipient=? ORDER BY id DESC LIMIT 50
+                """, (name,)) if row["request"] in visible]
+                data["requestComments"] = [dict(row) for row in db.execute("SELECT * FROM request_comments ORDER BY id")
+                                           if row["request"] in visible]
+                data["requestAttachments"] = [dict(row) for row in db.execute("""
+                    SELECT id,request,actor,name,created FROM request_attachments ORDER BY id
+                """) if row["request"] in visible]
                 projects = [row["name"] for row in db.execute("SELECT name FROM projects ORDER BY name='Офис', id")]
                 directions = {row["name"]: row["direction"] for row in db.execute("SELECT name,direction FROM articles ORDER BY id")}
-                data.update(entities=ENTITIES, projects=projects, articles=list(directions), articleDirections=directions, cashStages=CASH_STAGES,
+                if role == "manager":
+                    projects = [project for project in projects if project in USERS[name].get("projects", [])]
+                names = [row["name"] for row in db.execute("SELECT name FROM legal_entities ORDER BY id")]
+                data.update(entities=names, projects=projects, articles=list(directions), articleDirections=directions, cashStages=CASH_STAGES,
                             scenarios=SCENARIOS, user=name, role=role, demo=not USERS)
                 return self.reply(200, data)
         assets = {"/": ("index.html", "text/html"), "/style.css": ("style.css", "text/css"), "/app.js": ("app.js", "text/javascript"), "/pnl.js": ("pnl.js", "text/javascript"),
-                  "/schedules.js": ("schedules.js", "text/javascript")}
+                  "/schedules.js": ("schedules.js", "text/javascript"), "/release.js": ("release.js", "text/javascript")}
         if path in assets:
             filename, mime = assets[path]
             return self.send_data(200, (ROOT / "web" / filename).read_bytes(), mime + "; charset=utf-8")
@@ -1171,12 +1285,22 @@ class Handler(BaseHTTPRequestHandler):
             payload = json.loads(self.rfile.read(size))
             if not isinstance(payload, dict):
                 raise ValueError("Ожидается объект JSON.")
+            if self.path == "/api/export-report":
+                if identity[1] != "finance":
+                    raise PermissionError("Выгрузка доступна финансисту.")
+                return self.send_data(200, report_export.workbook(payload),
+                    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", "qodex-report.xlsx")
             with closing(connect()) as db, db:
                 db.execute("BEGIN IMMEDIATE")
                 result = mutate(db, self.path[5:], payload, *identity)
             self.reply(200, result)
         except PermissionError as exc:
             self.reply(403, {"error": str(exc)})
+        except sqlite3.IntegrityError as exc:
+            if str(exc) == period_close.LOCK_MESSAGE:
+                self.reply(409, {"error": str(exc)})
+            else:
+                self.reply(400, {"error": "Изменение нарушает связи существующих данных."})
         except (ValueError, KeyError, TypeError, AttributeError, InvalidOperation, OverflowError, csv.Error) as exc:
             self.reply(400, {"error": str(exc) if isinstance(exc, ValueError) else "Проверьте поля формы."})
 
@@ -1185,7 +1309,15 @@ if __name__ == "__main__":
     host = os.environ.get("HOST", "127.0.0.1")
     if host not in ("127.0.0.1", "::1", "localhost") and not USERS:
         raise SystemExit("Для сетевого режима задайте QODEX_USERS.")
-    if any(user.get("role") not in ("finance", "employee") or not user.get("password") for user in USERS.values()):
-        raise SystemExit("Укажите роль finance или employee и пароль каждого пользователя.")
+    if PROXY_TOKEN and len(PROXY_TOKEN) < 32:
+        raise SystemExit("Для входа через прокси задайте случайный токен длиной от 32 символов.")
+    for user in USERS.values():
+        if user.get("role") not in ("finance", "employee", "manager") or (not PROXY_TOKEN and not user.get("password")):
+            raise SystemExit("Укажите поддерживаемую роль и пароль либо включите корпоративный прокси.")
+        if user["role"] == "manager":
+            if not isinstance(user.get("projects"), list) or not user["projects"] or money(user.get("limit", 0), allow_zero=True) < 0:
+                raise SystemExit("Для руководителя задайте проекты и неотрицательный лимит.")
+            if "articles" in user and not isinstance(user["articles"], list):
+                raise SystemExit("Статьи руководителя задаются списком.")
     init()
     ThreadingHTTPServer((host, int(os.environ.get("PORT", "8000"))), Handler).serve_forever()

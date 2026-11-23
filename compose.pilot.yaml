@@ -1,0 +1,33 @@
+services:
+  qodex:
+    build: .
+    restart: unless-stopped
+    environment:
+      QODEX_USERS_FILE: /run/secrets/qodex_users
+      QODEX_SEED: "0"
+    secrets:
+      - qodex_users
+    volumes:
+      - pilot-data:/data
+  caddy:
+    image: caddy:2.10.2-alpine
+    restart: unless-stopped
+    depends_on:
+      - qodex
+    environment:
+      QODEX_DOMAIN: "${QODEX_DOMAIN:?Set the corporate domain}"
+      NO_PROXY: "qodex,auth,localhost,127.0.0.1"
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./deploy/Caddyfile:/etc/caddy/Caddyfile:ro
+      - tls-data:/data
+      - tls-config:/config
+secrets:
+  qodex_users:
+    file: "${QODEX_USERS_PATH:?Set the path to the private user directory}"
+volumes:
+  pilot-data:
+  tls-data:
+  tls-config:

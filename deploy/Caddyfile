@@ -1,0 +1,4 @@
+{$QODEX_DOMAIN} {
+	encode zstd gzip
+	reverse_proxy qodex:8000
+}
