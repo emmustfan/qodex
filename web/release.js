@@ -12,7 +12,9 @@ function periodsReport() {
     'close-period':'Закрытие месяца','reopen-period':'Повторное открытие','allocate':'Разнесение операции',
     'request':'Создание заявки','review':'Решение по заявке','request-comment':'Комментарий',
     'request-attach':'Вложение','link-payment':'Связь оплаты','import-tochka':'Импорт Точки','import':'Импорт CSV',
-    'confirm-schedule-month':'Подтверждение начисления','pnl-template':'Настройка P&L','accrual':'Ручное начисление'
+    'confirm-schedule-month':'Подтверждение начисления','pnl-template':'Настройка P&L','accrual':'Ручное начисление',
+    'monthly-rule':'Изменение правила проекта','monthly-rule-plan':'План по правилу','bonus-confirm':'Начисление премии',
+    'bonus-clear':'Отмена начисления премии','weekly-action-save':'Действие на неделю','weekly-action-status':'Статус действия'
   };
   const audit = data.audit.map(row => `<tr><td>${esc(row.created)}</td><td>${esc(row.actor)}</td>
     <td>${esc(auditNames[row.action] || row.action)}</td><td class="wrap">${esc(row.target)}</td></tr>`);
@@ -31,7 +33,8 @@ async function closePeriod(id) {
       ['Счета без сверки',checks.unreconciled.join(', ') || '0'],
       ['Операции без разнесения',checks.unassigned],
       ['Ожидаемые документы',checks.documents],
-      ['Неподтверждённые начисления из графиков',checks.schedules]
+      ['Неподтверждённые начисления из графиков',checks.schedules],
+      ['Премии к проверке',checks.bonuses]
     ].map(([name,value]) => `<tr><td>${name}</td><td>${esc(value)}</td></tr>`);
     const form = modal('Проверка закрытия',`<p>${esc(entityName(id))} · ${esc(payload.month)}</p>`
       + table('Замечания',['Проверка','Результат'],rows)

@@ -39,4 +39,23 @@ dialog:has(.allocation-split){width:min(920px,calc(100% - 24px))}
 .operation-selected td{background:#eef5ed}
 dialog .batch-confirm{display:flex;align-items:center;gap:9px}
 .batch-confirm input{flex:none}
+
+.month-stack{display:grid;gap:14px;min-width:0}
+#monthDesk{gap:28px}
+#monthDesk section{scroll-margin-top:18px}
+.month-cutoff,.month-links{display:flex;align-items:center;flex-wrap:wrap;gap:8px 12px}
+.month-cutoff label,.month-links{font-size:13px;color:var(--muted)}
+.month-cutoff button[aria-pressed="true"]{background:#e8f0e7;border-color:#a3bfa7;color:var(--dark)}
+.month-links{margin:16px 0 22px;padding:11px 0;border-bottom:1px solid var(--border)}
+.month-links a{color:var(--green);font-weight:650;text-underline-offset:3px}
+.month-metrics{margin:0}
+.month-receipts{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:10px 15px}
+.month-receipts strong{display:block;margin-top:4px;overflow-wrap:anywhere}
+.month-details{border:1px solid var(--border);border-radius:10px;padding:12px;background:white}
+.month-details summary{cursor:pointer;font-size:14px;font-weight:650;color:var(--dark)}
+.month-details > :not(summary){margin-top:10px}
+.month-rule-actions{justify-content:flex-start;gap:6px;min-width:170px}
+.bonus-month-field{grid-column:1/-1;max-width:250px;margin-bottom:6px}
+#month-rules td:not(:first-child),#month-rules th{white-space:normal}
+@media(max-width:760px){.month-receipts{grid-template-columns:repeat(2,minmax(0,1fr))}}
 @media(max-width:760px){.pnl-stage-grid{grid-template-columns:1fr}}

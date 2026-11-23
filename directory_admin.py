@@ -7,10 +7,12 @@ TABLES = {
         ("allocations", "project"), ("accruals", "project"), ("plans", "project"), ("requests", "project"),
         ("bank_rules", "project"), ("accrual_schedules", "project"), ("balances", "project"),
         ("office_contributions", "project"), ("forecast_entries", "project"),
+        ("monthly_rules", "project"), ("bonus_confirmations", "project"), ("weekly_actions", "project"),
     ),
     "articles": (
         ("allocations", "article"), ("allocations", "accrual_article"), ("accruals", "article"),
         ("plans", "article"), ("requests", "article"), ("bank_rules", "article"), ("accrual_schedules", "article"),
+        ("monthly_rules", "article"), ("monthly_rules", "income_article"), ("bonus_confirmations", "article"),
     ),
 }
 PROTECTED = {"projects": {"Офис"}, "articles": {"Финансирование", "Дивиденды"}}

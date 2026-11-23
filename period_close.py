@@ -49,6 +49,7 @@ def install_locks(db):
         "account_balances": lambda r: lock(account(r), f"substr({r}.day,1,7)", through=True),
         "balances": lambda r: lock("NULL", f"substr({r}.day,1,7)", through=True),
         "accruals": per_month,
+        "bonus_confirmations": per_month,
         "plans": per_month,
         "office_contributions": per_month,
         "office_distribution_rules": per_month,
@@ -136,8 +137,8 @@ def checklist(db, entity, period):
     return {"unreconciled": unreconciled, "unassigned": unassigned, "documents": documents, "schedules": schedules}
 
 
-def close(db, entity, period, actor, note, exceptions, expected=None):
-    checks = checklist(db, entity, period)
+def close(db, entity, period, actor, note, exceptions, expected=None, extra_checks=None):
+    checks = {**checklist(db, entity, period), **(extra_checks or {})}
     if expected is not None and expected != checks:
         raise ValueError("Результаты проверки изменились. Откройте её ещё раз.")
     if any(checks.values()) and not exceptions:

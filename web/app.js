@@ -3,10 +3,10 @@ const dialog = document.querySelector('#dialog');
 const nav = document.querySelector('#nav');
 const RUB = new Intl.NumberFormat('ru-RU', {style:'currency',currency:'RUB',maximumFractionDigits:2,minimumFractionDigits:0});
 const MONTHS = ['янв','фев','мар','апр','май','июн','июл','авг','сен','окт','ноя','дек'];
-const tabs = [['overview','▦','Обзор'],['operations','⇄','Операции'],['cash','▤','БДДС'],['calendar','▧','Платёжный календарь'],['forecast','↗','Прогноз денег'],['profit','▥','БДР / P&L'],['schedules','▦','Графики начислений'],['distribution','∑','Распределение прибыли'],['funds','◈','Фонды'],['requests','✓','Заявки'],['manager-finances','▥','Мои проекты'],['users','♙','Сотрудники'],['accounts','▱','Счета'],['periods','⊡','Закрытие месяца'],['directories','▤','Справочники']];
+const tabs = [['month-workspace','▧','Рабочий месяц'],['overview','▦','Обзор'],['operations','⇄','Операции'],['cash','▤','БДДС'],['calendar','▧','Платёжный календарь'],['forecast','↗','Прогноз денег'],['profit','▥','БДР / P&L'],['schedules','▦','Графики начислений'],['distribution','∑','Распределение прибыли'],['funds','◈','Фонды'],['requests','✓','Заявки'],['manager-finances','▥','Мои проекты'],['users','♙','Сотрудники'],['accounts','▱','Счета'],['periods','⊡','Закрытие месяца'],['directories','▤','Справочники']];
 const nonOperating = ['Финансирование','Дивиденды'];
 let data;
-let view = 'overview';
+let view = 'month-workspace';
 let period = new Date().toISOString().slice(0,7);
 let project = '';
 let entity = '';
@@ -82,7 +82,8 @@ function profitRows() {
     return [{...row,entity:legal,description:op.description,day:op.day,
       month:row.accrual,article:row.accrual_article || row.article}];
   });
-  return [...matched, ...data.accruals.filter(row => inEntity(row.entity))];
+  return [...matched, ...data.accruals.filter(row => inEntity(row.entity)),
+    ...data.bonus_accruals.filter(row => inEntity(row.entity))];
 }
 
 function totals(rows) {
@@ -159,7 +160,8 @@ function operationTable(compact = false) {
     const clientLabel = client ? 'Клиент: ' + client : hintedClient ? 'Подсказка: ' + hintedClient : '';
     const action = dividend ? button('Выплаты','profit-payments:' + dividend) : paired.has(op.id) ? button('Отвязать','unlink-transfer:' + op.id)
       : button(lines.length ? 'Открыть' : 'Распределить','allocate:' + op.id);
-    const selection = compact ? '' : operationCheckbox(op,allLines,linked.has(op.id) || paired.has(op.id) || paid.has(op.id));
+    const selection = compact ? '' : operationCheckbox(op,allLines,
+      linked.has(op.id) || paired.has(op.id) || paid.has(op.id) || allLines.some(line => line.bonus_month));
     return `<tr>${selection}<td>${esc(op.day)}</td><td class="wrap">${esc(op.description)}<small>${esc([payer,bankName(op.account)].filter(Boolean).join(' · '))}</small>${clientLabel ? `<small>${esc(clientLabel)}</small>` : ''}</td>
       <td>${category}${articles && !dividend ? `<small>${esc(articles)}</small>` : ''}${note ? `<small>${esc(note)}</small>` : ''}</td>
       <td class="${sign(amount)}">${rub(amount)}</td><td>${action} ${schedule ? button('Оплаты по графику','schedule-payments:' + schedule) : ''} ${!op.account ? button('Указать счёт','assign-account:' + op.id) : ''}</td></tr>`;
@@ -310,7 +312,7 @@ function report(basis) {
     const plannedAmount = totals(budget.filter(row => row.article === article)).net;
     return `<tr><td>${esc(article)}</td><td>${rub(plannedAmount)}</td><td>${rub(actualAmount)}</td><td class="${sign(actualAmount-plannedAmount)}">${rub(actualAmount-plannedAmount)}</td></tr>`;
   });
-  const extras = cash ? '' : table('Подтверждённые начисления',['Период','Проект','Описание','Сумма'],filterRows(data.accruals.filter(row => inEntity(row.entity))).map(item => `<tr><td>${esc(item.month)}</td><td>${esc(item.project)}</td><td class="wrap">${esc(item.description)}</td><td>${rub(item.amount)}</td></tr>`));
+  const extras = cash ? '' : table('Подтверждённые начисления',['Период','Проект','Описание','Сумма'],filterRows([...data.accruals,...data.bonus_accruals].filter(row => inEntity(row.entity))).map(item => `<tr><td>${esc(item.month)}</td><td>${esc(item.project)}</td><td class="wrap">${esc(item.description)}</td><td>${rub(item.amount)}</td></tr>`));
   return header(cash ? 'БДДС' : 'БДР / P&L',cash ? 'План и факт по датам платежей' : 'План и факт по месяцам начисления',planActions + (cash ? '' : button('+ Начисление','accrual') + button('Распределение прибыли','view:distribution') + button('Графики начислений','view:schedules') + switchView) + button('Экспорт Excel','export-report')) + filters(true,false,cash) + versionFilter + closeBadge()
     + `<div class="metrics">${card(cash ? 'Чистый денежный поток' : 'Операционный результат',rub(actual.net),`План ${rub(planned.net)}`)}${card(cash ? 'Поступления' : 'Доходы',rub(actual.incoming),`План ${rub(planned.incoming)}`)}${card(cash ? 'Выплаты' : 'Расходы',rub(actual.outgoing),`План ${rub(planned.outgoing)}`)}${cash ? card('Отклонение потока',rub(actual.net-planned.net),'Факт минус план') : card('Маржа проектов',pnlPercent(structure.margin),`Офисные расходы · ${rub(office.outgoing)}`)}</div>`
     + (display === 'structure' ? structure.html : table('План-факт по статьям',['Статья','План','Факт','Отклонение'],rows))
@@ -654,8 +656,16 @@ function render() {
     : finance() || key === 'requests';
   if (!allowed(view)) view = data.role === 'manager' ? 'manager-finances' : finance() ? 'overview' : 'requests';
   if (view === 'profit' || view === 'pnl-template' || view === 'calendar') account = '';
+  if (view === 'month-workspace') {
+    entity ||= String(legalOptions()[0][0]);
+    account = '';
+  }
   nav.innerHTML = '<p class="nav-label">РАЗДЕЛЫ</p>' + tabs.filter(([key]) => allowed(key)).map(([key,icon,text]) => `<button data-action="view:${key}" class="${view === key || (key === 'profit' && view === 'pnl-template') ? 'nav-active' : ''}" ${view === key || (key === 'profit' && view === 'pnl-template') ? 'aria-current="page"' : ''}><span class="nav-icon" aria-hidden="true">${icon}</span>${text}</button>`).join('');
   document.querySelector('#account').innerHTML = `<span class="avatar" aria-hidden="true">${esc(data.user[0])}</span><div>${esc(data.user)}<small>${roleNames[data.role]}</small></div>`;
+  if (view === 'month-workspace') {
+    content.innerHTML = workingMonth();
+    loadWorkingMonth();
+  }
   if (view === 'overview') content.innerHTML = overview();
   if (view === 'operations') {
     const count = bankSuggestions().length;
@@ -726,6 +736,7 @@ function allocation(op) {
   const previous = data.allocations.filter(item => item.operation === op.id);
   const fromBank = op.ref.startsWith('tochka:');
   const incoming = op.amount > 0;
+  const bonuses = incoming || schedule ? [] : data.bonus_confirmations.filter(row => row.entity === bank(op.account)?.entity);
   const direction = incoming ? 'income' : 'expense';
   const articleLabel = incoming ? 'Статья поступления' : 'Статья расхода';
   const articles = [...new Set([...articlesFor(direction),...previous.map(row => row.article)])];
@@ -737,7 +748,10 @@ function allocation(op) {
     ${selectField('Проект','project',[['','Выберите проект'],...activeProjects(previous.map(row => row.project)).map(name => [name,name])],line.project ?? '')}
     ${cashArticle(line.article)}${field('Сумма, ₽','amount','number',line.amount == null ? '' : line.amount / 100,'step="0.01" required')}
     ${field('Месяц БДР','accrual','month',line.accrual || '')}${profitArticle(line.accrual_article)}
-    <button type="button" class="button remove" aria-label="Удалить строку">×</button></div>`;
+    <button type="button" class="button remove" aria-label="Удалить строку">×</button>
+    ${bonuses.length || line.bonus_month ? `<div class="bonus-month-field" hidden>
+      ${selectField('Оплата премии за месяц','bonusMonth',[['','Обычное списание'],...(line.bonus_month ? [[line.bonus_month,line.bonus_month]] : [])],line.bonus_month,false)}
+    </div>` : ''}</div>`;
   const initial = {amount:op.amount,project:op.suggested_project ?? project,
     article:op.suggested_article ?? (fromBank ? '' : incoming ? '' : 'Разработка'),
     accrual:fromBank || incoming || op.document_pending ? '' : op.day.slice(0,7)};
@@ -770,13 +784,27 @@ function allocation(op) {
     await api('allocate',{id:op.id,lines,documentPending:values.has('documentPending'),remember:values.has('remember'),...extra});
   });
   const update = () => {
-    if (schedule) form.querySelectorAll('[name=accrual]').forEach(input => {input.disabled = true;});
+    for (const row of form.querySelectorAll('.split')) {
+      const accrual = row.querySelector('[name=accrual]');
+      const bonus = row.querySelector('[name=bonusMonth]');
+      if (bonus) {
+        const previousMonth = bonus.value;
+        const project = row.querySelector('[name=project]').value;
+        const article = row.querySelector('[name=article]').value;
+        const months = bonuses.filter(item => item.project === project && item.article === article).map(item => item.month);
+        for (const line of previous) {
+          if (line.bonus_month && line.project === project && line.article === article) months.push(line.bonus_month);
+        }
+        bonus.innerHTML = idOptions([['','Обычное списание'],...[...new Set(months)].sort().reverse().map(month => [month,month])],previousMonth);
+        bonus.closest('.bonus-month-field').hidden = !months.length;
+        if (bonus.value) accrual.value = '';
+      }
+      accrual.disabled = Boolean(schedule || bonus?.value);
+      row.querySelector('[name=accrualArticle]').disabled = !accrual.value;
+    }
     const assigned = [...form.querySelectorAll('[name=amount]')].reduce((total,input) => total + Math.round(Number(input.value) * 100),0);
     form.querySelector('#remaining').textContent = 'Осталось ' + rub(op.amount - assigned);
     if (incoming) {
-      form.querySelectorAll('.split').forEach(row => {
-        row.querySelector('[name=accrualArticle]').disabled = !row.querySelector('[name=accrual]').value;
-      });
       const showName = form.elements.client.value === 'new';
       form.querySelector('#new-client').hidden = !showName;
       form.elements.newClient.required = showName;
@@ -925,7 +953,8 @@ function budgetEntry(kind,basis,entry = null) {
 
 function doAction(action) {
   const [kind,arg] = action.split(':');
-  if (handlePnlAction(kind,arg) || handleScheduleAction(kind,arg) || releaseAction(kind,arg) || workspaceAction(kind,arg)) return;
+  if (handlePnlAction(kind,arg) || handleScheduleAction(kind,arg) || releaseAction(kind,arg) || workspaceAction(kind,arg)
+    || (view === 'month-workspace' && workingMonthAction(kind,arg))) return;
   if (kind === 'view') {
     if (view === 'operations' && arg !== view) selectedOperations.clear();
     view = arg;
@@ -1080,6 +1109,11 @@ document.addEventListener('click',event => {
 
 content.addEventListener('change',event => {
   const {id,value} = event.target;
+  if (id === 'workingDate') {
+    reviewDate = value && event.target.validity.valid ? value : '';
+    render();
+    return;
+  }
   if (id === 'selectVisibleOperations') {
     selectedOperations.clear();
     if (event.target.checked) {

@@ -20,6 +20,7 @@ import pilot_access
 import user_accounts
 import directory_admin
 import report_export
+import month_workspace
 
 ROOT = Path(__file__).resolve().parent
 DB = Path(os.environ.get("QODEX_DB", ROOT / "data" / "finance.sqlite3"))
@@ -226,6 +227,7 @@ def init():
             ("operations", "payer_label", "TEXT"),
             ("operations", "client", "INTEGER REFERENCES clients(id)"),
             ("allocations", "accrual_article", "TEXT"),
+            ("allocations", "bonus_month", "TEXT"),
             ("plans", "entity", "INTEGER"),
             ("plans", "source", "TEXT"),
             ("accruals", "entity", "INTEGER"),
@@ -279,6 +281,7 @@ def init():
                            [("Дизайн личного кабинета", "Команда продукта", "2026-06-27", SEED_PROJECTS[0], SEED_ARTICLES[3], 8500000, 1),
                             ("Облачные ресурсы на июнь", "Техлид", "2026-06-29", SEED_PROJECTS[1], SEED_ARTICLES[4], 4200000, 2)])
 
+        month_workspace.initialize(db, NON_OPERATING)
         period_close.install_locks(db)
 
 
@@ -605,7 +608,8 @@ def batch_allocation(db, payload, save=False):
           EXISTS(SELECT 1 FROM transfers t WHERE t.outgoing=o.id OR t.incoming=o.id)
           OR EXISTS(SELECT 1 FROM profit_payments p WHERE p.operation=o.id)
           OR EXISTS(SELECT 1 FROM request_payments p WHERE p.operation=o.id)
-          OR EXISTS(SELECT 1 FROM accrual_schedule_payments p WHERE p.operation=o.id) AS linked,
+          OR EXISTS(SELECT 1 FROM accrual_schedule_payments p WHERE p.operation=o.id)
+          OR EXISTS(SELECT 1 FROM allocations l WHERE l.operation=o.id AND l.bonus_month IS NOT NULL) AS linked,
           EXISTS(SELECT 1 FROM period_closures c WHERE (a.entity IS NULL OR c.entity=a.entity)
             AND (c.month=substr(o.day,1,7) OR EXISTS(SELECT 1 FROM allocations l
               WHERE l.operation=o.id AND l.accrual=c.month))) AS locked
@@ -618,7 +622,7 @@ def batch_allocation(db, payload, save=False):
     if any(row["amount"] * first_amount <= 0 for row in operations):
         raise ValueError("Выберите только поступления или только расходы.")
     if any(row["linked"] for row in operations):
-        raise ValueError("Операции, связанные с переводом, выплатой прибыли, заявкой или графиком, распределяются отдельно.")
+        raise ValueError("Операции, связанные с переводом, премией, выплатой прибыли, заявкой или графиком, распределяются отдельно.")
     if any(row["locked"] for row in operations):
         raise sqlite3.IntegrityError(period_close.LOCK_MESSAGE)
 
@@ -838,13 +842,15 @@ def distribute_office_costs(db, payload, save):
         WITH facts(project,amount) AS (
             SELECT project,amount FROM accruals WHERE entity=? AND month=?
             UNION ALL
+            SELECT project,amount FROM bonus_accruals WHERE entity=? AND month=?
+            UNION ALL
             SELECT l.project,l.amount FROM allocations l JOIN operations o ON o.id=l.operation
             JOIN accounts a ON a.id=o.account
             WHERE a.entity=? AND l.accrual=? AND l.article NOT IN (?,?)
         )
         SELECT project, SUM(MAX(amount,0)) AS income, SUM(MAX(-amount,0)) AS expense
         FROM facts GROUP BY project
-    """, (entity, period, entity, period, *NON_OPERATING)).fetchall()
+    """, (entity, period, entity, period, entity, period, *NON_OPERATING)).fetchall()
     expense = next((row["expense"] for row in facts if row["project"] == "Офис"), 0)
     if not expense:
         raise ValueError("За этот месяц у выбранного ООО нет начисленных расходов офиса.")
@@ -920,16 +926,74 @@ def read_manager_finances(db, projects):
             WHERE l.project IN ({scope}) AND l.accrual IS NOT NULL AND l.article NOT IN (?,?)
             UNION ALL
             SELECT project,entity,month,article,amount,'БДР' FROM accruals WHERE project IN ({scope})
+            UNION ALL
+            SELECT project,entity,month,article,amount,'БДР' FROM bonus_accruals WHERE project IN ({scope})
         )
         SELECT project,entity,month,article,basis,SUM(amount) AS amount,
                SUM(MAX(amount,0)) AS income,SUM(MAX(-amount,0)) AS expense
         FROM owned GROUP BY project,entity,month,article,basis
-    """, (*projects,*projects,*NON_OPERATING,*projects))]
+    """, (*projects,*projects,*NON_OPERATING,*projects,*projects))]
     return {
         "facts": facts,
         "plans": [dict(row) for row in db.execute(f"SELECT * FROM plans WHERE project IN ({scope})", projects)],
         "forecast": [dict(row) for row in db.execute(f"SELECT * FROM forecast_entries WHERE project IN ({scope})", projects)],
     }
+
+
+def change_working_month(db, action, payload, actor):
+    entity = entity_id(payload)
+    if action == "weekly-action-save":
+        project = payload.get("project") or None
+        if project:
+            ensure_project(db, project)
+        return month_workspace.action_save(db, entity, project, day(payload["day"]), payload["title"].strip(),
+                                           payload.get("assignee", "").strip(), payload.get("id"))
+    if action == "weekly-action-status":
+        item = int(payload["id"])
+        if db.execute("UPDATE weekly_actions SET done=? WHERE id=? AND entity=?",
+                      (payload["done"] is True,item,entity)).rowcount != 1:
+            raise ValueError("Действие не найдено.")
+        return item
+    period = month(payload["month"])
+    if action == "monthly-rule":
+        project, article, kind = payload["project"], payload["article"], payload["kind"]
+        if kind not in ("fixed", "commission", "off"):
+            raise ValueError("Выберите тип правила.")
+        ensure_project(db, project, allow_archived=kind == "off")
+        ensure_article(db, article, -1, accrual=True, allow_archived=kind == "off")
+        amount = positive_amount(payload["value"]) if kind != "off" else 0
+        if kind == "commission" and amount > 10000:
+            raise ValueError("Укажите процент от 0,01 до 100.")
+        source = (payload.get("incomeArticle") or None) if kind == "commission" else None
+        if source:
+            ensure_article(db, source, 1)
+            if source in NON_OPERATING:
+                raise ValueError("Выберите статью операционных поступлений.")
+        return month_workspace.save_rule(db, entity, period, project, article, kind, amount, source,
+                                         payload.get("expected"))
+    cutoff, scenario = day(payload["day"]), payload["scenario"]
+    if not cutoff.startswith(period) or scenario not in SCENARIOS:
+        raise ValueError("Проверьте дату среза и сценарий бюджета.")
+    if action == "month-review":
+        review = month_workspace.review(db, entity, period, cutoff, scenario, NON_OPERATING)
+        return {**review, "rules": [{**row, "token": bank_hash(row)} for row in review["rules"]]}
+    if db.execute("SELECT 1 FROM period_closures WHERE entity=? AND month=?", (entity,period)).fetchone():
+        raise sqlite3.IntegrityError(period_close.LOCK_MESSAGE)
+    plans = db.execute("SELECT * FROM plans WHERE entity=? AND month=? AND scenario=?",
+                       (entity,period,scenario)).fetchall()
+    rules = month_workspace.rule_rows(db, entity, period, cutoff, plans, NON_OPERATING)
+    rule = next((row for row in rules if row["id"] == int(payload["id"])),None)
+    if rule is None or payload.get("token") != bank_hash(rule):
+        raise ValueError("Расчёт изменился. Обновите рабочий месяц и проверьте сумму.")
+    if action == "monthly-rule-plan":
+        ensure_project(db, rule["project"])
+        ensure_article(db, rule["article"], -1, accrual=True)
+        month_workspace.apply_plan(db, entity, period, scenario, rule)
+    else:
+        if rule["kind"] != "commission":
+            raise ValueError("Выберите правило расчёта премии.")
+        month_workspace.confirm_bonus(db, entity, period, cutoff, rule, actor, action == "bonus-clear")
+    return f"{entity}:{period}:{rule['project']}:{rule['article']}"
 
 
 def mutate(db, action, payload, actor, role):
@@ -945,6 +1009,8 @@ def mutate(db, action, payload, actor, role):
     result = {}
     if action == "preview-tochka":
         return import_tochka(db, payload, save=False)
+    if action == "month-review":
+        return change_working_month(db, action, payload, actor)
     if action == "import-tochka":
         result = import_tochka(db, payload, save=True)
         target = f'{result["account"]}:{result["start"]}:{result["end"]}'
@@ -956,14 +1022,19 @@ def mutate(db, action, payload, actor, role):
     elif action == "batch-allocate":
         result = batch_allocation(db, payload, save=True)
         target = ",".join(map(str, sorted(payload["ids"])))
+    elif action in ("monthly-rule", "monthly-rule-plan", "bonus-confirm", "bonus-clear",
+                    "weekly-action-save", "weekly-action-status"):
+        target = str(change_working_month(db, action, payload, actor))
     elif action in ("preview-close", "close-period", "reopen-period"):
         entity, period = entity_id(payload), month(payload["month"])
+        extra_checks = {"bonuses": month_workspace.pending_bonuses(db, entity, period, NON_OPERATING)} \
+            if action != "reopen-period" else {}
         if action == "preview-close":
-            return period_close.checklist(db, entity, period)
+            return {**period_close.checklist(db, entity, period), **extra_checks}
         note = decision_note(payload["note"])
         if action == "close-period":
             period_close.close(db, entity, period, actor, note, payload.get("exceptions") is True,
-                               payload.get("expectedChecks"))
+                               payload.get("expectedChecks"), extra_checks)
         elif db.execute("DELETE FROM period_closures WHERE entity=? AND month=?", (entity, period)).rowcount != 1:
             raise ValueError("Период уже открыт.")
         target = f"{entity}:{period}:{note}"
@@ -1161,13 +1232,17 @@ def mutate(db, action, payload, actor, role):
             raise ValueError("Сначала отвяжите списание от решения о выплате.")
         if db.execute("SELECT 1 FROM transfers WHERE outgoing=? OR incoming=?", (oid, oid)).fetchone():
             raise ValueError("Сначала разорвите связь внутреннего перевода.")
-        op = db.execute("SELECT amount,account,party_key,counterparty,document_pending FROM operations WHERE id=?", (oid,)).fetchone()
+        op = db.execute("""
+            SELECT o.amount,o.account,o.party_key,o.counterparty,o.document_pending,a.entity
+            FROM operations o LEFT JOIN accounts a ON a.id=o.account WHERE o.id=?
+        """, (oid,)).fetchone()
         if not op:
             raise ValueError("Операция не найдена.")
-        previous_rows = db.execute("SELECT project,article,accrual_article FROM allocations WHERE operation=?", (oid,)).fetchall()
+        previous_rows = db.execute("SELECT project,article,accrual_article,bonus_month FROM allocations WHERE operation=?", (oid,)).fetchall()
         previous = {row["article"] for row in previous_rows}
         previous_projects = {row["project"] for row in previous_rows}
         previous_pnl = {row["accrual_article"] for row in previous_rows}
+        previous_bonus = {(row["project"],row["article"],row["bonus_month"]) for row in previous_rows if row["bonus_month"]}
         rows = []
         for row in payload["lines"]:
             project, article = row["project"], row["article"]
@@ -1181,7 +1256,15 @@ def mutate(db, action, payload, actor, role):
                 accrual_article = "Выручка по проекту"
             if accrual_article and accrual:
                 ensure_article(db, accrual_article, amount, accrual=True, allow_archived=accrual_article in previous_pnl)
-            rows.append((oid, project, article, amount, accrual, accrual_article if accrual else None))
+            bonus_month = month(row["bonusMonth"]) if row.get("bonusMonth") else None
+            if bonus_month:
+                if amount > 0 or accrual:
+                    raise ValueError("Оплату премии укажите в списании с пустым месяцем БДР.")
+                if (project,article,bonus_month) not in previous_bonus and not db.execute("""
+                    SELECT 1 FROM bonus_confirmations WHERE entity=? AND project=? AND article=? AND month=?
+                """, (op["entity"],project,article,bonus_month)).fetchone():
+                    raise ValueError("Выберите месяц подтверждённой премии по этому проекту и статье.")
+            rows.append((oid, project, article, amount, accrual, accrual_article if accrual else None, bonus_month))
 
         if not rows or sum(row[3] for row in rows) != op["amount"] or any(row[3] * op["amount"] <= 0 for row in rows):
             raise ValueError("Сумма строк и знак должны совпадать с суммой операции.")
@@ -1195,7 +1278,7 @@ def mutate(db, action, payload, actor, role):
             SELECT s.project FROM accrual_schedule_payments p JOIN accrual_schedules s ON p.schedule=s.id
             WHERE p.operation=?
         """, (oid,)).fetchone()
-        if schedule and any(row[1] != schedule["project"] or row[4] or row[2] in NON_OPERATING for row in rows):
+        if schedule and any(row[1] != schedule["project"] or row[4] or row[6] or row[2] in NON_OPERATING for row in rows):
             raise ValueError("Оплата связана с графиком. Сохраните его проект и оставьте месяц БДР пустым.")
         pending = payload.get("documentPending", bool(op["document_pending"])) is True
         if pending and any(row[4] for row in rows):
@@ -1210,7 +1293,7 @@ def mutate(db, action, payload, actor, role):
         assign_receipt_client(db, oid, op, payload)
         db.execute("UPDATE operations SET document_pending=? WHERE id=?", (pending, oid))
         db.execute("DELETE FROM allocations WHERE operation=?", (oid,))
-        db.executemany("INSERT INTO allocations(operation,project,article,amount,accrual,accrual_article) VALUES(?,?,?,?,?,?)", rows)
+        db.executemany("INSERT INTO allocations(operation,project,article,amount,accrual,accrual_article,bonus_month) VALUES(?,?,?,?,?,?,?)", rows)
         target = str(oid)
     elif action == "balance":
         target = payload["project"]
@@ -1253,7 +1336,7 @@ def mutate(db, action, payload, actor, role):
                 if not old:
                     raise ValueError("Строка плана не найдена.")
                 ensure_scope(role, project_scope, old["project"])
-                db.execute("UPDATE plans SET month=?,project=?,article=?,amount=?,basis=?,scenario=?,entity=? WHERE id=?",
+                db.execute("UPDATE plans SET month=?,project=?,article=?,amount=?,basis=?,scenario=?,entity=?,source=NULL WHERE id=?",
                            (*values, target))
             else:
                 target = str(db.execute("""
@@ -1423,7 +1506,8 @@ class Handler(BaseHTTPRequestHandler):
                 data = {table: [dict(row) for row in db.execute(f"SELECT * FROM {table}")]
                         for table in ("allocations", "plans", "accruals", "balances", "accounts", "account_balances", "statement_controls", "bank_statements", "transfers", "request_payments", "forecast_entries",
                                       "funds", "fund_entries", "profit_payments", "office_contributions", "clients",
-                                      "accrual_schedules", "schedule_months", "accrual_schedule_payments") if finance}
+                                      "accrual_schedules", "schedule_months", "accrual_schedule_payments", "bonus_accruals",
+                                      "bonus_confirmations") if finance}
                 if finance:
                     data["operations"] = read_operation_rows(db)
                     data["client_payers"] = [dict(row) for row in db.execute("SELECT DISTINCT client,payer FROM client_payers")]
@@ -1479,7 +1563,7 @@ class Handler(BaseHTTPRequestHandler):
                 return self.reply(200, data)
         assets = {"/": ("index.html", "text/html"), "/style.css": ("style.css", "text/css"), "/app.js": ("app.js", "text/javascript"), "/pnl.js": ("pnl.js", "text/javascript"),
                   "/schedules.js": ("schedules.js", "text/javascript"), "/release.js": ("release.js", "text/javascript"),
-                  "/workspace.js": ("workspace.js", "text/javascript")}
+                  "/workspace.js": ("workspace.js", "text/javascript"), "/month.js": ("month.js", "text/javascript")}
         if path in assets:
             filename, mime = assets[path]
             return self.send_data(200, (ROOT / "web" / filename).read_bytes(), mime + "; charset=utf-8")
