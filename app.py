@@ -17,6 +17,8 @@ import bank_statement
 import pnl_template
 import period_close
 import pilot_access
+import user_accounts
+import directory_admin
 import report_export
 
 ROOT = Path(__file__).resolve().parent
@@ -53,6 +55,9 @@ def init():
     DB.parent.mkdir(parents=True, exist_ok=True)
     with closing(connect()) as db, db:
         db.executescript("""
+        CREATE TABLE IF NOT EXISTS qodex_settings (
+          key TEXT PRIMARY KEY
+        );
         CREATE TABLE IF NOT EXISTS projects (
           id INTEGER PRIMARY KEY, name TEXT NOT NULL UNIQUE
         );
@@ -209,6 +214,9 @@ def init():
         """)
         db.execute("BEGIN IMMEDIATE")
         for table, column, definition in (
+            ("projects", "archived", "INTEGER NOT NULL DEFAULT 0"),
+            ("articles", "archived", "INTEGER NOT NULL DEFAULT 0"),
+            ("forecast_entries", "project", "TEXT"),
             ("accounts", "bank_key", "TEXT"),
             ("operations", "account", "INTEGER REFERENCES accounts(id)"),
             ("operations", "counterparty", "TEXT"),
@@ -228,8 +236,11 @@ def init():
                 db.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
         db.execute("CREATE UNIQUE INDEX IF NOT EXISTS accrual_schedule_month ON accruals(schedule_month)")
         db.executemany("INSERT OR IGNORE INTO legal_entities(id,name) VALUES(?,?)", enumerate(ENTITIES, 1))
-        db.executemany("INSERT OR IGNORE INTO projects(name) VALUES(?)", [(name,) for name in SEED_PROJECTS])
-        db.executemany("INSERT OR IGNORE INTO articles(name,direction) VALUES(?,?)", DEFAULT_ARTICLES.items())
+        if not db.execute("SELECT 1 FROM qodex_settings WHERE key='directory_initialized'").fetchone():
+            db.executemany("INSERT OR IGNORE INTO projects(name) VALUES(?)", [(name,) for name in SEED_PROJECTS])
+            db.executemany("INSERT OR IGNORE INTO articles(name,direction) VALUES(?,?)", DEFAULT_ARTICLES.items())
+            db.execute("INSERT INTO qodex_settings VALUES('directory_initialized')")
+        user_accounts.initialize(db, USERS)
         pnl_template.initialize(db, pnl_articles(DEFAULT_ARTICLES))
         db.execute("CREATE UNIQUE INDEX IF NOT EXISTS accounts_bank_key ON accounts(bank_key)")
         db.execute("UPDATE operations SET account=CASE WHEN ref IN ('demo-1','demo-2') THEN 2 ELSE 1 END "
@@ -285,18 +296,19 @@ def month(value):
     return day(value + "-01")[:7]
 
 
-def ensure_project(db, project):
-    if not db.execute("SELECT 1 FROM projects WHERE name=?", (project,)).fetchone():
-        raise ValueError("Выберите проект из списка.")
+def ensure_project(db, project, allow_archived=False):
+    row = db.execute("SELECT archived FROM projects WHERE name=?", (project,)).fetchone()
+    if not row or (row["archived"] and not allow_archived):
+        raise ValueError("Выберите действующий проект из списка.")
 
 
 def allow_article(direction, amount):
     return direction == "both" or direction == ("income" if amount > 0 else "expense")
 
 
-def ensure_article(db, article, amount, accrual=False):
-    row = db.execute("SELECT direction FROM articles WHERE name=?", (article,)).fetchone()
-    if not row or not allow_article(row["direction"], amount):
+def ensure_article(db, article, amount, accrual=False, allow_archived=False):
+    row = db.execute("SELECT direction,archived FROM articles WHERE name=?", (article,)).fetchone()
+    if not row or (row["archived"] and not allow_archived) or not allow_article(row["direction"], amount):
         raise ValueError("Выберите статью для поступления." if amount > 0 else "Выберите статью для расхода.")
     if accrual and article in (*NON_OPERATING, *CASH_STAGES):
         raise ValueError("Для БДР выберите статью начисления, например «Выручка по проекту».")
@@ -540,14 +552,16 @@ def import_tochka(db, payload, save):
 def read_operation_rows(db):
     rules = {(row["account"], row["party_key"], row["direction"]): row for row in db.execute("SELECT * FROM bank_rules")}
     clients = {row["party_key"]: row["client"] for row in db.execute("SELECT party_key,client FROM client_payers")}
-    directions = {row["name"]: row["direction"] for row in db.execute("SELECT name,direction FROM articles")}
+    directions = {row["name"]: row["direction"] for row in db.execute("SELECT name,direction FROM articles WHERE archived=0")}
+    projects = {row["name"] for row in db.execute("SELECT name FROM projects WHERE archived=0")}
     operations = []
     for row in db.execute("SELECT * FROM operations"):
         op = dict(row)
         key = op.pop("party_key")
         rule = rules.get((op["account"], key, 1 if op["amount"] > 0 else -1))
         article, project, flag = operation_hint(op, rule, directions)
-        operations.append({**op, "suggested_article": article, "suggested_project": project, "bank_hint": flag,
+        operations.append({**op, "suggested_article": article if allow_article(directions.get(article),op["amount"]) else None,
+                           "suggested_project": project if project in projects else None, "bank_hint": flag,
                            "suggested_client": clients.get(key) if op["amount"] > 0 else None,
                            "has_bank_payer": bool(key)})
     return operations
@@ -802,11 +816,51 @@ def distribute_office_costs(db, payload, save):
     return result
 
 
+def ensure_scope(role, projects, project):
+    if role == "manager" and (not project or project == "Офис" or project not in projects):
+        raise PermissionError("Можно работать только с назначенными вам проектами.")
+
+
+def read_manager_finances(db, projects):
+    if not projects:
+        return {"facts": [], "plans": [], "forecast": []}
+    scope = ",".join("?" for _ in projects)
+    # Send aggregates only. Bank account details, the rest of split operations, and the office stay on the server.
+    facts = [dict(row) for row in db.execute(f"""
+        WITH owned(project,entity,month,article,amount,basis) AS (
+            SELECT l.project,a.entity,substr(o.day,1,7),l.article,l.amount,'БДДС'
+            FROM allocations l JOIN operations o ON o.id=l.operation
+            JOIN accounts a ON a.id=o.account
+            WHERE l.project IN ({scope})
+            AND NOT EXISTS (SELECT 1 FROM profit_payments p WHERE p.operation=o.id)
+            UNION ALL
+            SELECT l.project,a.entity,l.accrual,COALESCE(l.accrual_article,l.article),l.amount,'БДР'
+            FROM allocations l JOIN operations o ON o.id=l.operation
+            JOIN accounts a ON a.id=o.account
+            WHERE l.project IN ({scope}) AND l.accrual IS NOT NULL AND l.article NOT IN (?,?)
+            UNION ALL
+            SELECT project,entity,month,article,amount,'БДР' FROM accruals WHERE project IN ({scope})
+        )
+        SELECT project,entity,month,article,basis,SUM(amount) AS amount,
+               SUM(MAX(amount,0)) AS income,SUM(MAX(-amount,0)) AS expense
+        FROM owned GROUP BY project,entity,month,article,basis
+    """, (*projects,*projects,*NON_OPERATING,*projects))]
+    return {
+        "facts": facts,
+        "plans": [dict(row) for row in db.execute(f"SELECT * FROM plans WHERE project IN ({scope})", projects)],
+        "forecast": [dict(row) for row in db.execute(f"SELECT * FROM forecast_entries WHERE project IN ({scope})", projects)],
+    }
+
+
 def mutate(db, action, payload, actor, role):
-    if role != "finance" and action not in ("request", "request-comment", "request-attach", "request-alert-seen") and not (
-        role == "manager" and action == "review"
+    users = user_accounts.active(db)
+    project_scope = users.get(actor, {}).get("projects", [])
+    manager_actions = ("plan", "remove-plan", "forecast", "remove-forecast")
+    request_actions = ("request", "request-comment", "request-attach", "request-alert-seen")
+    if role not in user_accounts.FINANCE_ROLES and action not in request_actions and not (
+        role == "manager" and action in manager_actions
     ):
-        raise PermissionError("Действие доступно финансисту.")
+        raise PermissionError("У этой роли нет доступа к действию.")
     target = ""
     result = {}
     if action == "preview-tochka":
@@ -865,6 +919,17 @@ def mutate(db, action, payload, actor, role):
         directions = {row["name"]: row["direction"] for row in db.execute("SELECT name,direction FROM articles")}
         result["revision"] = pnl_template.save(db, payload, pnl_articles(directions))
         target = str(result["revision"])
+    elif action in ("user-save", "user-remove", "user-restore"):
+        if role != "owner":
+            raise PermissionError("Управление сотрудниками доступно владельцу.")
+        target = user_accounts.change(db, action, payload, bool(PROXY_TOKEN))
+    elif action == "article-edit":
+        name = payload["name"].strip()
+        directory_admin.edit_article(db, payload["current"], name, payload["direction"])
+        target = f'{payload["current"]}:{name}'
+    elif action == "directory-change":
+        directory_admin.change(db, payload["category"], payload["name"], payload["mode"])
+        target = f'{payload["category"]}:{payload["name"]}:{payload["mode"]}'
     elif action == "project":
         name = directory_name(db, "projects", payload["name"])
         target = str(db.execute("INSERT INTO projects(name) VALUES(?)", (name,)).lastrowid)
@@ -1014,12 +1079,15 @@ def mutate(db, action, payload, actor, role):
         op = db.execute("SELECT amount,account,party_key,counterparty,document_pending FROM operations WHERE id=?", (oid,)).fetchone()
         if not op:
             raise ValueError("Операция не найдена.")
-        previous = {row["article"] for row in db.execute("SELECT article FROM allocations WHERE operation=?", (oid,))}
+        previous_rows = db.execute("SELECT project,article,accrual_article FROM allocations WHERE operation=?", (oid,)).fetchall()
+        previous = {row["article"] for row in previous_rows}
+        previous_projects = {row["project"] for row in previous_rows}
+        previous_pnl = {row["accrual_article"] for row in previous_rows}
         rows = []
         for row in payload["lines"]:
             project, article = row["project"], row["article"]
             amount = money(row["amount"])
-            ensure_project(db, project)
+            ensure_project(db, project, allow_archived=project in previous_projects)
             if article not in previous:
                 ensure_article(db, article, op["amount"])
             accrual = month(row["accrual"]) if row.get("accrual") else None
@@ -1027,7 +1095,7 @@ def mutate(db, action, payload, actor, role):
             if accrual and article in CASH_STAGES and not accrual_article:
                 accrual_article = "Выручка по проекту"
             if accrual_article and accrual:
-                ensure_article(db, accrual_article, amount, accrual=True)
+                ensure_article(db, accrual_article, amount, accrual=True, allow_archived=accrual_article in previous_pnl)
             rows.append((oid, project, article, amount, accrual, accrual_article if accrual else None))
 
         if not rows or sum(row[3] for row in rows) != op["amount"] or any(row[3] * op["amount"] <= 0 for row in rows):
@@ -1069,7 +1137,7 @@ def mutate(db, action, payload, actor, role):
         db.execute("UPDATE request_alerts SET seen=1 WHERE recipient=?", (actor,))
         return result
     elif action in ("request-comment", "request-attach"):
-        request = pilot_access.request_for(db, payload["id"], actor, role, USERS)
+        request = pilot_access.request_for(db, payload["id"], actor, role, users)
         if action == "request-comment":
             pilot_access.add_comment(db, request["id"], actor, payload["body"])
         else:
@@ -1088,16 +1156,26 @@ def mutate(db, action, payload, actor, role):
                 INSERT INTO accruals(month,project,article,amount,description,entity) VALUES(?,?,?,?,?,?)
             """, (month(payload["month"]), project, article, amount, description, entity_id(payload))).lastrowid)
         elif action == "plan":
+            ensure_scope(role, project_scope, project)
             basis, scenario = payload["basis"], payload["scenario"]
             if basis not in ("БДР", "БДДС") or scenario not in SCENARIOS:
                 raise ValueError("Проверьте тип бюджета и сценарий.")
             ensure_article(db, article, amount, accrual=basis == "БДР")
-            target = str(db.execute("""
-                INSERT INTO plans(month,project,article,amount,basis,scenario,entity) VALUES(?,?,?,?,?,?,?)
-            """, (month(payload["month"]), project, article, amount, basis, scenario, entity_id(payload))).lastrowid)
+            values = (month(payload["month"]), project, article, amount, basis, scenario, entity_id(payload))
+            if payload.get("id"):
+                target = str(int(payload["id"]))
+                old = db.execute("SELECT project FROM plans WHERE id=?", (target,)).fetchone()
+                if not old:
+                    raise ValueError("Строка плана не найдена.")
+                ensure_scope(role, project_scope, old["project"])
+                db.execute("UPDATE plans SET month=?,project=?,article=?,amount=?,basis=?,scenario=?,entity=? WHERE id=?",
+                           (*values, target))
+            else:
+                target = str(db.execute("""
+                    INSERT INTO plans(month,project,article,amount,basis,scenario,entity) VALUES(?,?,?,?,?,?,?)
+                """, values).lastrowid)
         else:
-            if role == "manager" and project not in USERS.get(actor, {}).get("projects", []):
-                raise PermissionError("Выберите один из назначенных вам проектов.")
+            ensure_scope(role, project_scope, project)
             ensure_article(db, article, -1)
             title = payload["title"].strip()
             if not title or len(title) > 200 or amount <= 0:
@@ -1110,14 +1188,33 @@ def mutate(db, action, payload, actor, role):
         target = str(result["version"])
     elif action == "forecast":
         description = payload["description"].strip()
+        project = payload.get("project") or None
+        ensure_scope(role, project_scope, project)
+        if project:
+            ensure_project(db, project)
         if not description or len(description) > 200:
             raise ValueError("Укажите назначение до 200 символов.")
-        target = str(db.execute("INSERT INTO forecast_entries(entity,day,description,amount) VALUES(?,?,?,?)",
-                                (entity_id(payload), day(payload["day"]), description, money(payload["amount"]))).lastrowid)
-    elif action == "remove-forecast":
+        values = (entity_id(payload), day(payload["day"]), description, money(payload["amount"]), project)
+        if payload.get("id"):
+            target = str(int(payload["id"]))
+            old = db.execute("SELECT project FROM forecast_entries WHERE id=?", (target,)).fetchone()
+            if not old:
+                raise ValueError("Ожидаемая операция не найдена.")
+            ensure_scope(role, project_scope, old["project"])
+            db.execute("UPDATE forecast_entries SET entity=?,day=?,description=?,amount=?,project=? WHERE id=?",
+                       (*values,target))
+        else:
+            target = str(db.execute("""
+                INSERT INTO forecast_entries(entity,day,description,amount,project) VALUES(?,?,?,?,?)
+            """, values).lastrowid)
+    elif action in ("remove-forecast", "remove-plan"):
+        table = "plans" if action == "remove-plan" else "forecast_entries"
         target = str(int(payload["id"]))
-        if db.execute("DELETE FROM forecast_entries WHERE id=?", (target,)).rowcount != 1:
-            raise ValueError("Прогнозная строка не найдена.")
+        row = db.execute(f"SELECT project FROM {table} WHERE id=?", (target,)).fetchone()
+        if not row:
+            raise ValueError("Строка не найдена.")
+        ensure_scope(role, project_scope, row["project"])
+        db.execute(f"DELETE FROM {table} WHERE id=?", (target,))
     elif action == "link-payment":
         request, operation = int(payload["request"]), int(payload["operation"])
         if not link_payment(db, request, operation):
@@ -1142,11 +1239,11 @@ def mutate(db, action, payload, actor, role):
         if payload["status"] not in ("Согласована", "Отклонена"):
             raise ValueError("Неизвестное решение.")
         target = str(int(payload["id"]))
-        request = pilot_access.request_for(db, target, actor, role, USERS)
+        request = pilot_access.request_for(db, target, actor, role, users)
         if request["status"] != "На согласовании":
             raise ValueError("Заявка уже обработана.")
-        if not pilot_access.can_review(request, actor, role, USERS, money):
-            raise PermissionError("Заявку согласует другой пользователь с доступом к проекту и достаточным лимитом.")
+        if not pilot_access.can_review(request, actor, role, users):
+            raise PermissionError("Заявку согласует финансовый директор или владелец, кроме её автора.")
         db.execute("UPDATE requests SET status=? WHERE id=?", (payload["status"], target))
         if payload.get("note", "").strip():
             pilot_access.add_comment(db, request["id"], actor, payload["status"] + ". " + payload["note"].strip())
@@ -1155,29 +1252,43 @@ def mutate(db, action, payload, actor, role):
     if action in ("request", "review", "request-comment", "request-attach", "reschedule", "link-payment", "unlink-payment"):
         request_id = int(target.split(":")[0])
         request = db.execute("SELECT * FROM requests WHERE id=?", (request_id,)).fetchone()
-        pilot_access.notify_request(db, request, action, actor, USERS, money)
+        pilot_access.notify_request(db, request, action, actor, users)
     db.execute("INSERT INTO audit(actor,action,target) VALUES(?,?,?)", (actor, action, target))
     return result
 
 
 class Handler(BaseHTTPRequestHandler):
     def identity(self):
-        if PROXY_TOKEN:
-            supplied = self.headers.get("X-Qodex-Proxy-Token", "")
-            actor = self.headers.get("X-Qodex-User", "")
-            if actor in USERS and hmac.compare_digest(PROXY_TOKEN.encode(), supplied.encode()):
-                return actor, USERS[actor]["role"]
-            return None
-        if not USERS:
-            return "Демо-пользователь", "finance"
-        try:
-            scheme, token = self.headers.get("Authorization", "").split(" ", 1)
-            name, password = b64decode(token, validate=True).decode().split(":", 1)
-            if scheme == "Basic" and name in USERS and hmac.compare_digest(password.encode(), USERS[name]["password"].encode()):
-                return name, USERS[name]["role"]
-        except (ValueError, UnicodeError):
-            pass
+        with closing(connect()) as db:
+            if PROXY_TOKEN:
+                supplied = self.headers.get("X-Qodex-Proxy-Token", "")
+                login = self.headers.get("X-Qodex-User", "")
+                if hmac.compare_digest(PROXY_TOKEN.encode(), supplied.encode()):
+                    user = user_accounts.identity(db, login)
+                    if user:
+                        return login, user["role"]
+                return None
+            if not USERS and not USERS_FILE and not db.execute("SELECT 1 FROM workspace_users LIMIT 1").fetchone():
+                return user_accounts.DEMO_NAME, "finance"
+            try:
+                scheme, token = self.headers.get("Authorization", "").split(" ", 1)
+                login, password = b64decode(token, validate=True).decode().split(":", 1)
+                user = user_accounts.identity(db, login)
+                if scheme == "Basic" and user and user_accounts.password_matches(password, user["digest"]):
+                    return login, user["role"]
+            except (ValueError, UnicodeError):
+                pass
         return None
+
+    def verify_role(self, db, identity):
+        login, role = identity
+        if login == user_accounts.DEMO_NAME and not USERS and not USERS_FILE and not PROXY_TOKEN and not db.execute(
+            "SELECT 1 FROM workspace_users LIMIT 1"
+        ).fetchone():
+            return True
+        current = user_accounts.identity(db, login)
+        return bool(current and current["role"] == role)
+
 
     def send_data(self, code, data, mime="application/json; charset=utf-8", filename=None):
         self.send_response(code)
@@ -1210,7 +1321,9 @@ class Handler(BaseHTTPRequestHandler):
                 try:
                     if row is None:
                         raise PermissionError()
-                    pilot_access.request_for(db, row["request"], *identity, USERS)
+                    if not self.verify_role(db, identity):
+                        raise PermissionError()
+                    pilot_access.request_for(db, row["request"], *identity, user_accounts.active(db))
                 except PermissionError:
                     return self.reply(404, {"error": "Файл не найден."})
                 return self.send_data(200, row["data"], "application/octet-stream", row["name"])
@@ -1218,11 +1331,15 @@ class Handler(BaseHTTPRequestHandler):
             name, role = identity
             with closing(connect()) as db:
                 db.execute("BEGIN")
+                if not self.verify_role(db, identity):
+                    return self.reply(403, {"error": "Права изменились. Войдите заново."})
+                users = user_accounts.active(db)
+                finance = role in user_accounts.FINANCE_ROLES
                 data = {table: [dict(row) for row in db.execute(f"SELECT * FROM {table}")]
                         for table in ("allocations", "plans", "accruals", "balances", "accounts", "account_balances", "statement_controls", "bank_statements", "transfers", "request_payments", "forecast_entries",
                                       "funds", "fund_entries", "profit_payments", "office_contributions", "clients",
-                                      "accrual_schedules", "schedule_months", "accrual_schedule_payments") if role == "finance"}
-                if role == "finance":
+                                      "accrual_schedules", "schedule_months", "accrual_schedule_payments") if finance}
+                if finance:
                     data["operations"] = read_operation_rows(db)
                     data["client_payers"] = [dict(row) for row in db.execute("SELECT DISTINCT client,payer FROM client_payers")]
                     data["profit_decisions"] = profit_decision_rows(db)
@@ -1240,13 +1357,16 @@ class Handler(BaseHTTPRequestHandler):
                         {**dict(row), "rows": json.loads(row["rows"])}
                         for row in db.execute("SELECT * FROM budget_versions ORDER BY id DESC")
                     ]
-                requests = request_rows(db, None if role in ("finance", "manager") else name)
+                    data["directoryUsed"] = {
+                        category: sorted(directory_admin.used_names(db, category)) for category in directory_admin.TABLES
+                    }
+                if role == "owner":
+                    data["workspaceUsers"] = user_accounts.read(db)
+                requests = request_rows(db, None if finance or role == "manager" else name)
                 data["requests"] = [
-                    {**row, "canReview": pilot_access.can_review(row, name, role, USERS, money),
-                     "route": "Руководитель проекта или финансист" if any(
-                         login != row["author"] and pilot_access.manager_matches(user, row, money)
-                         for login, user in USERS.items()) else "Финансист"}
-                    for row in requests if pilot_access.can_view(row, name, role, USERS)
+                    {**row, "canReview": pilot_access.can_review(row, name, role, users),
+                     "route": "Финансовый директор"}
+                    for row in requests if pilot_access.can_view(row, name, role, users)
                 ]
                 visible = {row["id"] for row in data["requests"]}
                 data["requestAlerts"] = [dict(row) for row in db.execute("""
@@ -1257,16 +1377,24 @@ class Handler(BaseHTTPRequestHandler):
                 data["requestAttachments"] = [dict(row) for row in db.execute("""
                     SELECT id,request,actor,name,created FROM request_attachments ORDER BY id
                 """) if row["request"] in visible]
-                projects = [row["name"] for row in db.execute("SELECT name FROM projects ORDER BY name='Офис', id")]
-                directions = {row["name"]: row["direction"] for row in db.execute("SELECT name,direction FROM articles ORDER BY id")}
+                project_rows = db.execute("SELECT name,archived FROM projects ORDER BY name='Офис', id").fetchall()
+                projects = [row["name"] for row in project_rows]
+                articles = db.execute("SELECT name,direction,archived FROM articles ORDER BY id").fetchall()
+                directions = {row["name"]: row["direction"] for row in articles}
                 if role == "manager":
-                    projects = [project for project in projects if project in USERS[name].get("projects", [])]
+                    projects = [project for project in projects if project != "Офис" and project in users[name]["projects"]]
+                    data["managerFinances"] = read_manager_finances(db, projects)
+                elif not finance:
+                    projects = [row["name"] for row in project_rows if not row["archived"]]
                 names = [row["name"] for row in db.execute("SELECT name FROM legal_entities ORDER BY id")]
                 data.update(entities=names, projects=projects, articles=list(directions), articleDirections=directions, cashStages=CASH_STAGES,
-                            scenarios=SCENARIOS, user=name, role=role, demo=not USERS)
+                            archivedProjects=[row["name"] for row in project_rows if row["archived"] and row["name"] in projects],
+                            archivedArticles=[row["name"] for row in articles if row["archived"]],
+                            scenarios=SCENARIOS, user=name, role=role, demo=not users, authProxy=bool(PROXY_TOKEN))
                 return self.reply(200, data)
         assets = {"/": ("index.html", "text/html"), "/style.css": ("style.css", "text/css"), "/app.js": ("app.js", "text/javascript"), "/pnl.js": ("pnl.js", "text/javascript"),
-                  "/schedules.js": ("schedules.js", "text/javascript"), "/release.js": ("release.js", "text/javascript")}
+                  "/schedules.js": ("schedules.js", "text/javascript"), "/release.js": ("release.js", "text/javascript"),
+                  "/workspace.js": ("workspace.js", "text/javascript")}
         if path in assets:
             filename, mime = assets[path]
             return self.send_data(200, (ROOT / "web" / filename).read_bytes(), mime + "; charset=utf-8")
@@ -1286,12 +1414,14 @@ class Handler(BaseHTTPRequestHandler):
             if not isinstance(payload, dict):
                 raise ValueError("Ожидается объект JSON.")
             if self.path == "/api/export-report":
-                if identity[1] != "finance":
+                if identity[1] not in user_accounts.FINANCE_ROLES:
                     raise PermissionError("Выгрузка доступна финансисту.")
                 return self.send_data(200, report_export.workbook(payload),
                     "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", "qodex-report.xlsx")
             with closing(connect()) as db, db:
                 db.execute("BEGIN IMMEDIATE")
+                if not self.verify_role(db, identity):
+                    raise PermissionError("Права изменились. Войдите заново.")
                 result = mutate(db, self.path[5:], payload, *identity)
             self.reply(200, result)
         except PermissionError as exc:
@@ -1307,17 +1437,18 @@ class Handler(BaseHTTPRequestHandler):
 
 if __name__ == "__main__":
     host = os.environ.get("HOST", "127.0.0.1")
-    if host not in ("127.0.0.1", "::1", "localhost") and not USERS:
-        raise SystemExit("Для сетевого режима задайте QODEX_USERS.")
     if PROXY_TOKEN and len(PROXY_TOKEN) < 32:
         raise SystemExit("Для входа через прокси задайте случайный токен длиной от 32 символов.")
     for user in USERS.values():
-        if user.get("role") not in ("finance", "employee", "manager") or (not PROXY_TOKEN and not user.get("password")):
+        if user.get("role") not in user_accounts.ROLES or (not PROXY_TOKEN and not user.get("password")):
             raise SystemExit("Укажите поддерживаемую роль и пароль либо включите корпоративный прокси.")
-        if user["role"] == "manager":
-            if not isinstance(user.get("projects"), list) or not user["projects"] or money(user.get("limit", 0), allow_zero=True) < 0:
-                raise SystemExit("Для руководителя задайте проекты и неотрицательный лимит.")
-            if "articles" in user and not isinstance(user["articles"], list):
-                raise SystemExit("Статьи руководителя задаются списком.")
+        if user["role"] == "manager" and (
+            not isinstance(user.get("projects"), list) or not any(project != "Офис" for project in user["projects"])
+        ):
+            raise SystemExit("Для руководителя задайте хотя бы один проект.")
     init()
+    if host not in ("127.0.0.1", "::1", "localhost"):
+        with closing(connect()) as db:
+            if not user_accounts.active(db):
+                raise SystemExit("Для сетевого режима настройте действующие учётные записи.")
     ThreadingHTTPServer((host, int(os.environ.get("PORT", "8000"))), Handler).serve_forever()

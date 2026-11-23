@@ -2,22 +2,17 @@
 
 import re
 from base64 import b64decode
+from user_accounts import FINANCE_ROLES
 
 
 def can_view(request, actor, role, users):
-    return (role == "finance" or request["author"] == actor
+    return (role in FINANCE_ROLES or request["author"] == actor
             or role == "manager" and request["project"] in users.get(actor, {}).get("projects", []))
 
 
-def manager_matches(user, request, money):
-    return (user.get("role") == "manager" and request["project"] in user.get("projects", [])
-            and ("articles" not in user or request["article"] in user["articles"])
-            and request["amount"] <= money(user.get("limit", 0), allow_zero=True))
-
-
-def can_review(request, actor, role, users, money):
+def can_review(request, actor, role, users):
     return (request["status"] == "На согласовании" and (not users or request["author"] != actor)
-            and (role == "finance" or manager_matches(users.get(actor, {}), request, money)))
+            and role in FINANCE_ROLES)
 
 
 def request_for(db, value, actor, role, users):
@@ -47,7 +42,7 @@ def add_attachment(db, request, actor, filename, data):
 
 
 
-def notify_request(db, request, action, actor, users, money):
+def notify_request(db, request, action, actor, users):
     labels = {
         "request": "Новая заявка к рассмотрению",
         "review": request["status"],
@@ -61,7 +56,7 @@ def notify_request(db, request, action, actor, users, money):
         role = user["role"]
         if recipient == actor or not can_view(request, recipient, role, users):
             continue
-        if action == "request" and not can_review(request, recipient, role, users, money):
+        if action == "request" and not can_review(request, recipient, role, users):
             continue
         if action in ("review", "reschedule", "link-payment", "unlink-payment") and recipient != request["author"]:
             continue

@@ -5,7 +5,7 @@ services:
       - "127.0.0.1:${QODEX_DEMO_PORT:-8031}:8000"
     environment:
       QODEX_SEED: "1"
-      QODEX_USERS: '{"demo":{"password":"qodex-demo","role":"finance"},"manager":{"password":"qodex-manager","role":"manager","projects":["Ро-бот"],"limit":100000},"employee":{"password":"qodex-employee","role":"employee"}}'
+      QODEX_USERS: '{"demo":{"password":"qodex-demo","role":"owner"},"manager":{"password":"qodex-manager","role":"manager","projects":["Ро-бот"]},"finance":{"password":"qodex-finance","role":"finance"},"employee":{"password":"qodex-employee","role":"employee"}}'
     volumes:
       - demo-data:/data
 volumes:

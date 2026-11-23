@@ -122,8 +122,8 @@ function pnlEditor() {
     return `<select aria-label="${esc(label)}" data-pnl-article="${esc(name)}" data-pnl-scope="${scope}">
       ${idOptions([['','Без блока'],...choices],routing.get(scope + ':' + name) || '')}</select>`;
   };
-  const articleRows = [...articlesFor('income',true).map(name => [name,1]),
-    ...articlesFor('expense',true).map(name => [name,-1])].sort(([a],[b]) => a.localeCompare(b,'ru')).map(([name,direction]) =>
+  const articleRows = [...articlesFor('income',true,true).map(name => [name,1]),
+    ...articlesFor('expense',true,true).map(name => [name,-1])].sort(([a],[b]) => a.localeCompare(b,'ru')).map(([name,direction]) =>
     `<tr><td>${esc(name)}<small>${direction > 0 ? 'Доход' : 'Расход'}</small></td>
       <td>${scopeSelect(name,'project',direction)}</td><td>${scopeSelect(name,'office',direction)}</td></tr>`);
   return header('Шаблон P&L','Общая структура для проектов, ООО и группы',

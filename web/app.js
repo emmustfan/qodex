@@ -3,7 +3,7 @@ const dialog = document.querySelector('#dialog');
 const nav = document.querySelector('#nav');
 const RUB = new Intl.NumberFormat('ru-RU', {style:'currency',currency:'RUB',maximumFractionDigits:2,minimumFractionDigits:0});
 const MONTHS = ['янв','фев','мар','апр','май','июн','июл','авг','сен','окт','ноя','дек'];
-const tabs = [['overview','▦','Обзор'],['operations','⇄','Операции'],['cash','▤','БДДС'],['calendar','▧','Платёжный календарь'],['forecast','↗','Прогноз денег'],['profit','▥','БДР / P&L'],['schedules','▦','Графики начислений'],['distribution','∑','Распределение прибыли'],['funds','◈','Фонды'],['requests','✓','Заявки'],['accounts','▱','Счета'],['periods','⊡','Закрытие месяца'],['directories','▤','Справочники']];
+const tabs = [['overview','▦','Обзор'],['operations','⇄','Операции'],['cash','▤','БДДС'],['calendar','▧','Платёжный календарь'],['forecast','↗','Прогноз денег'],['profit','▥','БДР / P&L'],['schedules','▦','Графики начислений'],['distribution','∑','Распределение прибыли'],['funds','◈','Фонды'],['requests','✓','Заявки'],['manager-finances','▥','Мои проекты'],['users','♙','Сотрудники'],['accounts','▱','Счета'],['periods','⊡','Закрытие месяца'],['directories','▤','Справочники']];
 const nonOperating = ['Финансирование','Дивиденды'];
 let data;
 let view = 'overview';
@@ -21,7 +21,7 @@ const esc = value => String(value ?? '').replace(/[&<>"']/g, char => ({'&':'&amp
 const rub = cents => RUB.format(cents / 100);
 const sign = cents => cents < 0 ? 'negative' : cents > 0 ? 'positive' : '';
 const options = (items, selected) => items.map(item => `<option ${item === selected ? 'selected' : ''}>${esc(item)}</option>`).join('');
-const finance = () => data.role === 'finance';
+const finance = () => ['owner','finance'].includes(data.role);
 const button = (label, action, primary = false) => `<button class="button ${primary ? 'primary' : ''}" data-action="${action}">${label}</button>`;
 const card = (label, value, note) => `<article class="card metric"><div class="metric-label">${label}</div><strong>${value}</strong><small>${note}</small></article>`;
 const table = (title, headings, rows, empty = 'За выбранный период записей нет.', action = '') => `<section class="card table-card"><div class="card-head"><h2>${title}</h2>${action}</div>${rows.length ? `<div class="scroll"><table><thead><tr>${headings.map(item => `<th scope="col">${item}</th>`).join('')}</tr></thead><tbody>${rows.join('')}</tbody></table></div>` : `<p class="empty">${empty}</p>`}</section>`;
@@ -45,8 +45,8 @@ const transferMap = () => new Map(data.transfers.flatMap(({outgoing,incoming}) =
 const profitPaymentMap = () => new Map(data.profit_payments.map(row => [row.operation,row.decision]));
 
 const clientName = id => data.clients.find(row => row.id === id)?.name || '';
-const articlesFor = (direction,accrual = false) => Object.entries(data.articleDirections)
-  .filter(([name,kind]) => (kind === direction || kind === 'both')
+const articlesFor = (direction,accrual = false,includeArchived = false) => Object.entries(data.articleDirections)
+  .filter(([name,kind]) => (kind === direction || kind === 'both') && (includeArchived || !data.archivedArticles.includes(name))
     && (!accrual || (!nonOperating.includes(name) && !data.cashStages.includes(name))))
   .map(([name]) => name);
 const matchesDirection = op => !operationDirection || (op.amount > 0 ? 'income' : 'expense') === operationDirection;
@@ -226,7 +226,7 @@ function paymentStatus(item) {
 }
 
 function requestActions(item) {
-  if (item.canReview) return button('Решение','review:' + item.id);
+  if (item.canReview) return button('Согласовать','approve-request:' + item.id) + ' ' + button('Отказать','reject-request:' + item.id);
   return finance() && item.status === 'Согласована' ? button('Оплаты','payments:' + item.id) : '';
 }
 
@@ -238,9 +238,9 @@ function requests() {
     <td>${rub(item.amount)}</td><td>${rub(item.paid)}</td>
     <td><span class="pill ${item.status === 'На согласовании' ? 'pending' : ''}">${paymentStatus(item)}</span>
     ${item.status === 'На согласовании' ? `<small>${esc(item.route)}</small>` : ''}</td>
-    <td>${requestActions(item)} ${button('Обсуждение','thread-open:' + item.id)}</td></tr>`);
+    <td>${requestActions(item)} ${button('Комментарии и PDF','thread-open:' + item.id)}</td></tr>`);
   const actions = button('Обновить','release-refresh') + button(unread ? `Уведомления (${unread})` : 'Уведомления','request-alerts')
-    + (data.projects.length ? button('+ Новая заявка','request',true) : '');
+    + (activeProjects().length ? button('+ Новая заявка','request',true) : '');
   return header('Заявки на расходы','Согласованные заявки попадают в базовый план БДДС.',actions)
     + table(finance() ? 'Все заявки' : data.role === 'manager' ? 'Заявки моих проектов' : 'Мои заявки',
       ['Назначение','Проект','Статья','ООО','Дата оплаты','Сумма','Оплачено','Статус',''],rows,'Заявок пока нет.');
@@ -298,7 +298,7 @@ function forecast() {
   });
   const formats = value => known ? rub(value) : '—';
   const items = [...manual].sort((a,b) => a.day.localeCompare(b.day) || a.id-b.id).map(item =>
-    `<tr><td>${esc(item.day)}</td><td>${esc(entityName(item.entity))}</td><td class="wrap">${esc(item.description)}</td><td>${rub(item.amount)}</td><td>${button('Удалить','remove-forecast:' + item.id)}</td></tr>`);
+    `<tr><td>${esc(item.day)}</td><td>${esc(entityName(item.entity))}</td><td class="wrap">${esc(item.description)}<small>${esc(item.project || 'Компания')}</small></td><td>${rub(item.amount)}</td><td>${button('Удалить','remove-forecast:' + item.id)}</td></tr>`);
   return header('Прогноз денег','Факт по счетам на сегодня, ожидаемые операции и остатки заявок',button('+ Ожидаемая операция','forecast',true))
     + `<div class="toolbar"><input type="month" aria-label="Горизонт прогноза" id="period" min="${today.slice(0,7)}" value="${horizon}"><select id="entity" aria-label="Юридическое лицо"><option value="">Все ООО</option>${idOptions(legalOptions(),entity)}</select></div>
       <div class="metrics">${card('Остаток на сегодня',formats(initial),known ? 'С учётом банковских операций' : 'Проверьте входящие остатки и счета')}${card('Остаток на конец периода',formats(running),`Горизонт ${horizon}`)}${card('Минимальный остаток',formats(minimum),minimum < 0 ? 'Прогнозируется кассовый разрыв' : 'На горизонте прогноза')}${card('К оплате по заявкам',rub(totals(obligations).outgoing),'Только неоплаченные суммы')}</div>`
@@ -388,7 +388,7 @@ function fundsReport() {
 }
 
 function officeDistribution() {
-  const projects = data.projects.filter(name => name !== 'Офис');
+  const projects = activeProjects().filter(name => name !== 'Офис');
   const form = modal('Распределить расходы офиса',selectField('ООО','entity',legalOptions(),entity)
     + selectField('База распределения','method',[['revenue','Признанная выручка проектов'],['weights','Доли вручную']])
     + `<div id="office-weights" hidden><small>Например, введите 60 и 40. Проекты с нулевым весом пропускаются.</small>
@@ -526,10 +526,11 @@ function accountReport() {
 }
 
 function directories() {
-  const names = data.projects.map(name => `<tr><td>${esc(name)}</td></tr>`);
+  const names = data.projects.map((name,index) => `<tr><td>${esc(name)}${data.archivedProjects.includes(name) ? '<small>В архиве</small>' : ''}</td>
+    <td>${directoryControls('projects',name,index)}</td></tr>`);
   const directions = {income:'Поступления',expense:'Расходы',both:'Оба направления'};
   const articles = Object.entries(data.articleDirections).sort(([a],[b]) => a.localeCompare(b,'ru')).map(([name,direction]) =>
-    `<tr><td>${esc(name)}${data.cashStages.includes(name) ? '<small>Этап оплаты в БДДС</small>' : ''}</td><td>${directions[direction]}</td></tr>`);
+    `<tr><td>${esc(name)}${data.cashStages.includes(name) ? '<small>Этап оплаты в БДДС</small>' : ''}</td><td>${directions[direction]}${data.archivedArticles.includes(name) ? '<small>В архиве</small>' : ''}</td><td>${directoryControls('articles',name,data.articles.indexOf(name))}</td></tr>`);
   const payers = Map.groupBy(data.client_payers,row => row.client);
   const receipts = Map.groupBy(data.operations.filter(op => op.amount > 0 && op.client),op => op.client);
   const clients = data.clients.map(item => {
@@ -541,18 +542,20 @@ function directories() {
     `<tr><td>${esc(label)}</td><td>${button('Переименовать','rename-entity:' + id)}</td></tr>`);
   return header('Справочники','Проекты, статьи и основные клиенты')
     + '<div class="directory-grid">'
-    + table('Проекты',['Название'],names,'Проектов пока нет.',button('+ Проект','project',true))
+    + table('Проекты',['Название',''],names,'Проектов пока нет.',button('+ Проект','project',true))
     + table('Клиенты',['Основной клиент','Плательщики из поступлений'],clients,'Добавьте клиента здесь или в карточке поступления.',button('+ Клиент','client',true))
     + '</div><div class="calendar-gap"></div>'
-    + table('Статьи',['Название','Направление'],articles,'Статей пока нет.',button('+ Статья','article',true))
+    + table('Статьи',['Название','Направление',''],articles,'Статей пока нет.',button('+ Статья','article',true))
     + '<div class="calendar-gap"></div>' + table('Юридические лица',['Название',''],companies);
 }
 
 function render() {
-  if (!finance()) view = 'requests';
+  const allowed = key => key === 'users' ? data.role === 'owner' : key === 'manager-finances' ? data.role === 'manager'
+    : finance() || key === 'requests';
+  if (!allowed(view)) view = data.role === 'manager' ? 'manager-finances' : finance() ? 'overview' : 'requests';
   if (view === 'profit' || view === 'pnl-template' || view === 'calendar') account = '';
-  nav.innerHTML = '<p class="nav-label">РАЗДЕЛЫ</p>' + tabs.filter(([key]) => finance() || key === 'requests').map(([key,icon,text]) => `<button data-action="view:${key}" class="${view === key || (key === 'profit' && view === 'pnl-template') ? 'nav-active' : ''}" ${view === key || (key === 'profit' && view === 'pnl-template') ? 'aria-current="page"' : ''}><span class="nav-icon" aria-hidden="true">${icon}</span>${text}</button>`).join('');
-  document.querySelector('#account').innerHTML = `<span class="avatar" aria-hidden="true">${esc(data.user[0])}</span><div>${esc(data.user)}<small>${finance() ? 'Финансист' : data.role === 'manager' ? 'Руководитель проекта' : 'Сотрудник'}</small></div>`;
+  nav.innerHTML = '<p class="nav-label">РАЗДЕЛЫ</p>' + tabs.filter(([key]) => allowed(key)).map(([key,icon,text]) => `<button data-action="view:${key}" class="${view === key || (key === 'profit' && view === 'pnl-template') ? 'nav-active' : ''}" ${view === key || (key === 'profit' && view === 'pnl-template') ? 'aria-current="page"' : ''}><span class="nav-icon" aria-hidden="true">${icon}</span>${text}</button>`).join('');
+  document.querySelector('#account').innerHTML = `<span class="avatar" aria-hidden="true">${esc(data.user[0])}</span><div>${esc(data.user)}<small>${roleNames[data.role]}</small></div>`;
   if (view === 'overview') content.innerHTML = overview();
   if (view === 'operations') {
     const count = bankSuggestions().length;
@@ -572,6 +575,8 @@ function render() {
   if (view === 'distribution') content.innerHTML = distributionReport();
   if (view === 'directories') content.innerHTML = directories();
   if (view === 'periods') content.innerHTML = periodsReport();
+  if (view === 'users') content.innerHTML = usersReport();
+  if (view === 'manager-finances') content.innerHTML = projectFinances();
 }
 
 const field = (label, name, type, value = '', extra = '') => `<label>${label}<input name="${name}" type="${type}" value="${esc(value)}" ${extra}></label>`;
@@ -624,9 +629,9 @@ function allocation(op) {
   const cashArticle = (selected) => selectField(articleLabel,'article',
     [['','Выберите статью'],...articles.map(name => [name,name])],selected);
   const profitArticle = (selected) => selectField('Статья БДР','accrualArticle',
-    [['','По умолчанию'],...articlesFor(direction,true).map(name => [name,name])],selected,false);
+    [['','По умолчанию'],...[...new Set([...articlesFor(direction,true),...previous.map(row => row.accrual_article).filter(Boolean)])].map(name => [name,name])],selected,false);
   const makeRow = (line = {}) => `<div class="split ${incoming ? 'receipt-split' : ''}">
-    ${selectField('Проект','project',[['','Выберите проект'],...data.projects.map(name => [name,name])],line.project ?? '')}
+    ${selectField('Проект','project',[['','Выберите проект'],...activeProjects(previous.map(row => row.project)).map(name => [name,name])],line.project ?? '')}
     ${cashArticle(line.article)}${field('Сумма, ₽','amount','number',line.amount == null ? '' : line.amount / 100,'step="0.01" required')}
     ${field('Месяц БДР','accrual','month',line.accrual || '')}${incoming ? profitArticle(line.accrual_article) : ''}
     <button type="button" class="button remove" aria-label="Удалить строку">×</button></div>`;
@@ -790,30 +795,32 @@ function confirmSuggestions() {
   form.querySelector('[type=submit]').textContent = 'Подтвердить разнесение';
 }
 
-function budgetEntry(kind,basis) {
+function budgetEntry(kind,basis,entry = null) {
   const accrual = kind === 'accrual';
   const isPnl = accrual || basis === 'БДР';
   const directions = isPnl ? [['income','Доход'],['expense','Расход']] : [['income','Поступление'],['expense','Выплата']];
+  const selectedScenario = entry?.scenario || scenario;
   const form = modal(accrual ? 'Ручное начисление' : 'Строка плана · ' + basis,
-    (accrual ? field('Описание','description','text','','required maxlength="200"') : `<small>Сценарий «${esc(scenario)}»</small>`)
-    + selectField('ООО','entity',legalOptions(),entity)
-    + `<div class="fields">${selectField('Вид строки','direction',directions)}${picker('Проект','project',data.projects,project)}
-    ${selectField('Статья','article',[])}${field('Месяц','month','month',period,'required')}
-    ${field('Сумма, ₽','amount','number','','step="0.01" min="0.01" required')}</div>`,
+    (accrual ? field('Описание','description','text','','required maxlength="200"') : `<small>Сценарий «${esc(selectedScenario)}»</small>`)
+    + selectField('ООО','entity',legalOptions(),entry?.entity ?? entity)
+    + `<div class="fields">${selectField('Вид строки','direction',directions,entry?.amount < 0 ? 'expense' : 'income')}
+    ${picker('Проект','project',activeProjects(),entry?.project ?? project)}${selectField('Статья','article',[])}
+    ${field('Месяц','month','month',entry?.month || period,'required')}
+    ${field('Сумма, ₽','amount','number',entry ? Math.abs(entry.amount) / 100 : '','step="0.01" min="0.01" required')}</div>`,
   values => api(kind,{
-    ...Object.fromEntries(values),basis,scenario,
+    ...Object.fromEntries(values),id:entry?.id,basis,scenario:selectedScenario,
     amount:(values.get('direction') === 'expense' ? '-' : '') + values.get('amount')
   }));
-  const update = () => {
-    form.elements.article.innerHTML = idOptions(articlesFor(form.elements.direction.value,isPnl).map(name => [name,name]));
+  const update = (initial = null) => {
+    form.elements.article.innerHTML = idOptions(articlesFor(form.elements.direction.value,isPnl).map(name => [name,name]),initial);
   };
-  form.elements.direction.onchange = update;
-  update();
+  form.elements.direction.onchange = () => update();
+  update(entry?.article);
 }
 
 function doAction(action) {
   const [kind,arg] = action.split(':');
-  if (handlePnlAction(kind,arg) || handleScheduleAction(kind,arg) || releaseAction(kind,arg)) return;
+  if (handlePnlAction(kind,arg) || handleScheduleAction(kind,arg) || releaseAction(kind,arg) || workspaceAction(kind,arg)) return;
   if (kind === 'view') {
     view = arg;
     version = '';
@@ -823,7 +830,7 @@ function doAction(action) {
   }
   const defaultDate = period + '-01';
   const amount = (value = '',extra = '') => field('Сумма, ₽','amount','number',value,`step="0.01" required ${extra}`);
-  const category = articles => selectField('ООО','entity',legalOptions(),entity) + `<div class="fields">${picker('Проект','project',data.projects,project)}${picker('Статья','article',articles)}</div>`;
+  const category = articles => selectField('ООО','entity',legalOptions(),entity) + `<div class="fields">${picker('Проект','project',activeProjects(),project)}${picker('Статья','article',articles)}</div>`;
   const save = (title,fields) => modal(title,fields,values => api(kind,{...Object.fromEntries(values),basis:arg,scenario}));
   if (kind === 'project') save('Новый проект',field('Название проекта','name','text','','maxlength="100" required'));
   if (kind === 'article') save('Новая статья',field('Название статьи','name','text','','maxlength="100" required')
@@ -844,7 +851,7 @@ function doAction(action) {
   if (kind === 'office-distribution') officeDistribution();
   if (kind === 'office-contribution') {
     const form = modal('Вклад проекта в офис',selectField('ООО','entity',legalOptions(),entity)
-      + picker('Проект','project',data.projects.filter(name => name !== 'Офис'),project)
+      + picker('Проект','project',activeProjects().filter(name => name !== 'Офис'),project)
       + amount('','min="0"') + '<small>Вклад относится к выбранному месяцу. Ноль снимает распределение. Результат ООО и БДДС сохраняются.</small>',
       values => api(kind,{...Object.fromEntries(values),month:period}));
     const update = () => {
@@ -931,6 +938,7 @@ function doAction(action) {
       version = String(result.version);
     });
   if (kind === 'forecast') save('Ожидаемая операция',selectField('ООО','entity',legalOptions(),entity)
+    + selectField('Проект','project',[['','Компания'],...activeProjects().map(name => [name,name])],project,false)
     + field('Дата','day','date',document.querySelector('#period').value + '-01','required')
     + field('Назначение','description','text','','required maxlength="200"')
     + amount() + '<small>Поступление со знаком плюс, выплата со знаком минус. Оплаты по заявкам уже учитываются. После отражения в выписке удалите ручную строку.</small>');
@@ -943,10 +951,14 @@ function doAction(action) {
     modal('Перенести оплату',field('Новая дата оплаты','day','date',dueDate(item),'required'),
       values => api(kind,{id:item.id,day:values.get('day')}));
   }
-  if (kind === 'review') {
+  if (kind === 'approve-request' || kind === 'reject-request') {
     const item = data.requests.find(row => row.id === Number(arg));
-    modal('Решение по заявке',`<p class="subtitle">${esc(item.title)} · ${rub(item.amount)}</p>` + picker('Решение','status',['Согласована','Отклонена'])
-      + field('Комментарий к решению','note','text','','maxlength="1000"'),values => api('review',{id:item.id,status:values.get('status'),note:values.get('note')}));
+    const reject = kind === 'reject-request';
+    const title = reject ? 'Отказать в заявке' : 'Согласовать заявку';
+    const form = modal(title,`<p class="subtitle">${esc(item.title)} · ${rub(item.amount)}</p>`
+      + field('Комментарий к решению','note','text','','maxlength="1000"'),
+    values => api('review',{id:item.id,status:reject ? 'Отклонена' : 'Согласована',note:values.get('note')}));
+    form.querySelector('[type=submit]').textContent = reject ? 'Отказать' : 'Согласовать';
   }
 }
 

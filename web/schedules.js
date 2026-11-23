@@ -80,7 +80,7 @@ function newSchedule() {
   const form = modal('Новый график',
     field('Договор или назначение','title','text','','maxlength="200" required')
     + selectField('ООО','entity',legalOptions(),entity)
-    + `<div class="fields">${picker('Проект','project',data.projects,project)}
+    + `<div class="fields">${picker('Проект','project',activeProjects(),project)}
       ${selectField('Вид начисления','direction',[['income','Выручка'],['expense','Расход']])}
       ${selectField('Статья БДР','article',[])}${field('Первый месяц','start','month',period,'required')}
       ${field('Количество месяцев','count','number','12','min="1" max="60" step="1" required')}
