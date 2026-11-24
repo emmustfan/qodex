@@ -69,7 +69,8 @@ function cashRows(includeTransfers = false) {
     const article = !other ? 'Без распределения' : bank(other.account)?.entity === bank(op.account)?.entity ? 'Между счетами' : 'Между ООО';
     const lines = paid.has(op.id) ? [{amount:op.amount,project:'',article:'Дивиденды'}]
       : byOperation.get(op.id) || [{amount:op.amount,project:'',article}];
-    return lines.map(row => ({...row, month:op.day.slice(0,7),day:op.day,account:op.account}));
+    return lines.map(row => ({...row, month:op.day.slice(0,7),day:op.day,account:op.account,
+      entity:bank(op.account)?.entity,description:op.description}));
   });
 }
 
@@ -240,6 +241,7 @@ async function openBatchAllocation() {
         selectedOperations.clear();
         return `Распределено операций: ${result.applied}.`;
       });
+    form.elements.article.addEventListener('change',() => useArticleProject(form.elements.article.value,form.elements.project));
     if (form.elements.accrual) {
       const update = () => {
         const enabled = Boolean(form.elements.accrual.value);
@@ -282,14 +284,15 @@ function overview() {
 
 function report(basis) {
   const cash = basis === 'БДДС';
-  const fact = filterRows(cash ? cashRows() : profitRows());
+  const groupFilter = reportGroupFilter();
+  const grouped = Boolean(reportArticleGroup);
+  const fact = filterArticleGroups(filterRows(cash ? cashRows() : profitRows()));
   if (cash && account) {
     const actual = totals(fact);
-    const rows = [...new Set(fact.map(row => row.article))].map(article =>
-      `<tr><td>${esc(article)}</td><td>${rub(totals(fact.filter(row => row.article === article)).net)}</td></tr>`);
-    return header('БДДС',esc(bankName(Number(account))) + ' · факт по датам платежей',button('Экспорт Excel','export-report')) + filters() + closeBadge()
+    return header('БДДС',esc(bankName(Number(account))) + ' · факт по датам платежей',button('Справочник статей','article-directory') + button('Экспорт Excel','export-report'))
+      + filters() + `<div class="toolbar">${groupFilter}</div>` + closeBadge()
       + `<div class="metrics">${card('Чистый денежный поток',rub(actual.net),'Факт за месяц')}${card('Поступления',rub(actual.incoming),'Факт за месяц')}${card('Выплаты',rub(actual.outgoing),'Факт за месяц')}</div>`
-      + table('Движение по статьям',['Статья','Факт'],rows);
+      + financialTree('Движение по группам статей',groupedArticleNodes(reportEntries([],fact)),'cash-account','fact');
   }
   let budget = filterRows(data.plans.filter(row => row.basis === basis && row.scenario === scenario && inEntity(row.entity)));
   if (cash && scenario === data.scenarios[0]) {
@@ -298,24 +301,24 @@ function report(basis) {
   const versions = data.budget_versions.filter(item => item.month === period && item.basis === basis && item.scenario === scenario);
   const saved = versions.find(item => item.id === Number(version));
   if (saved) budget = filterRows(saved.rows.filter(row => inEntity(row.entity)));
-  const versionFilter = `<div class="toolbar"><select id="version" aria-label="Версия плана"><option value="">Текущий план</option>${idOptions(versions.map(item => [item.id,item.name]),version)}</select></div>`;
+  budget = filterArticleGroups(budget);
+  const versionFilter = `<div class="toolbar">${groupFilter}<select id="version" aria-label="Версия плана"><option value="">Текущий план</option>${idOptions(versions.map(item => [item.id,item.name]),version)}</select></div>`;
   const planActions = saved ? '' : button('+ Строка плана','plan:' + basis,true) + button('Зафиксировать план','freeze-budget:' + basis);
-  const structure = cash ? null : structuredPnl(budget,fact);
-  const display = cash || pnlMode === 'articles' ? 'articles' : 'structure';
-  const switchView = cash ? '' : button(display === 'structure' ? 'По статьям' : 'Структура P&L',
-    'pnl-mode:' + (display === 'structure' ? 'articles' : 'structure')) + button('Настроить шаблон','pnl-edit');
+  const structure = cash || grouped ? null : pnlStructure(budget,fact);
+  const flat = Boolean(structure && pnlMode === 'articles');
+  const switchView = structure ? button(flat ? 'Дерево БДР' : 'По статьям','pnl-mode:' + (flat ? 'structure' : 'articles')) : '';
   const actual = totals(fact), planned = totals(budget);
-  const office = totals(fact.filter(row => row.project === 'Офис'));
-  const trans = new Set([...budget,...fact].map(row => row.article));
-  const rows = [...trans].map(article => {
-    const actualAmount = totals(fact.filter(row => row.article === article)).net;
-    const plannedAmount = totals(budget.filter(row => row.article === article)).net;
-    return `<tr><td>${esc(article)}</td><td>${rub(plannedAmount)}</td><td>${rub(actualAmount)}</td><td class="${sign(actualAmount-plannedAmount)}">${rub(actualAmount-plannedAmount)}</td></tr>`;
-  });
-  const extras = cash ? '' : table('Подтверждённые начисления',['Период','Проект','Описание','Сумма'],filterRows([...data.accruals,...data.bonus_accruals].filter(row => inEntity(row.entity))).map(item => `<tr><td>${esc(item.month)}</td><td>${esc(item.project)}</td><td class="wrap">${esc(item.description)}</td><td>${rub(item.amount)}</td></tr>`));
-  return header(cash ? 'БДДС' : 'БДР / P&L',cash ? 'План и факт по датам платежей' : 'План и факт по месяцам начисления',planActions + (cash ? '' : button('+ Начисление','accrual') + button('Распределение прибыли','view:distribution') + button('Графики начислений','view:schedules') + switchView) + button('Экспорт Excel','export-report')) + filters(true,false,cash) + versionFilter + closeBadge()
-    + `<div class="metrics">${card(cash ? 'Чистый денежный поток' : 'Операционный результат',rub(actual.net),`План ${rub(planned.net)}`)}${card(cash ? 'Поступления' : 'Доходы',rub(actual.incoming),`План ${rub(planned.incoming)}`)}${card(cash ? 'Выплаты' : 'Расходы',rub(actual.outgoing),`План ${rub(planned.outgoing)}`)}${cash ? card('Отклонение потока',rub(actual.net-planned.net),'Факт минус план') : card('Маржа проектов',pnlPercent(structure.margin),`Офисные расходы · ${rub(office.outgoing)}`)}</div>`
-    + (display === 'structure' ? structure.html : table('План-факт по статьям',['Статья','План','Факт','Отклонение'],rows))
+  const entries = reportEntries(budget,fact);
+  const tableTitle = flat ? 'План и факт по статьям' : structure ? 'Дерево БДР' : 'План и факт по группам статей';
+  const nodes = flat ? [...Map.groupBy(entries,entry => entry.row.article)].map(([article,rows]) => ({id:article,label:article,entries:rows}))
+    : structure?.nodes || groupedArticleNodes(entries);
+  const extras = cash ? '' : table('Подтверждённые начисления',['Период','Проект','Описание','Сумма'],filterArticleGroups(filterRows([...data.accruals,...data.bonus_accruals].filter(row => inEntity(row.entity)))).map(item => `<tr><td>${esc(item.month)}</td><td>${esc(item.project)}</td><td class="wrap">${esc(item.description)}</td><td>${rub(item.amount)}</td></tr>`));
+  const resultLabel = grouped ? 'Сальдо по группе' : cash ? 'Чистый денежный поток' : 'Операционный результат';
+  const lastCard = structure ? card('Скорректированный доход проектов',rub(structure.adjusted),`Маржа ${pnlPercent(structure.margin)}`)
+    : card('Отклонение',rub(actual.net-planned.net),'Факт минус план');
+  return header(cash ? 'БДДС' : 'БДР / P&L',cash ? 'План и факт по датам платежей' : 'План и факт по месяцам начисления',planActions + (cash ? '' : button('+ Начисление','accrual') + button('Распределение прибыли','view:distribution') + button('Графики начислений','view:schedules') + switchView) + button('Справочник статей','article-directory') + button('Экспорт Excel','export-report')) + filters(true,false,cash) + versionFilter + closeBadge()
+    + `<div class="metrics">${card(resultLabel,rub(actual.net),`План ${rub(planned.net)}`)}${card(cash ? 'Поступления' : 'Доходы',rub(actual.incoming),`План ${rub(planned.incoming)}`)}${card(cash ? 'Выплаты' : 'Расходы',rub(actual.outgoing),`План ${rub(planned.outgoing)}`)}${lastCard}</div>`
+    + financialTree(tableTitle,nodes,basis)
     + (extras ? '<div class="calendar-gap"></div>' + extras : '');
 }
 
@@ -630,9 +633,6 @@ function accountReport() {
 function directories() {
   const names = data.projects.map((name,index) => `<tr><td>${esc(name)}${data.archivedProjects.includes(name) ? '<small>В архиве</small>' : ''}</td>
     <td>${directoryControls('projects',name,index)}</td></tr>`);
-  const directions = {income:'Поступления',expense:'Расходы',both:'Оба направления'};
-  const articles = Object.entries(data.articleDirections).sort(([a],[b]) => a.localeCompare(b,'ru')).map(([name,direction]) =>
-    `<tr><td>${esc(name)}${data.cashStages.includes(name) ? '<small>Этап оплаты в БДДС</small>' : ''}</td><td>${directions[direction]}${data.archivedArticles.includes(name) ? '<small>В архиве</small>' : ''}</td><td>${directoryControls('articles',name,data.articles.indexOf(name))}</td></tr>`);
   const payers = Map.groupBy(data.client_payers,row => row.client);
   const receipts = Map.groupBy(data.operations.filter(op => op.amount > 0 && op.client),op => op.client);
   const clients = data.clients.map(item => {
@@ -642,25 +642,23 @@ function directories() {
   });
   const companies = legalOptions().map(([id,label]) =>
     `<tr><td>${esc(label)}</td><td>${button('Переименовать','rename-entity:' + id)}</td></tr>`);
-  return header('Справочники','Проекты, статьи и основные клиенты')
-    + '<div class="directory-grid">'
+  return header('Справочники','Проекты, статьи и основные клиенты') + articleDirectory()
+    + '<div class="calendar-gap"></div><div class="directory-grid">'
     + table('Проекты',['Название',''],names,'Проектов пока нет.',button('+ Проект','project',true))
     + table('Клиенты',['Основной клиент','Плательщики из поступлений'],clients,'Добавьте клиента здесь или в карточке поступления.',button('+ Клиент','client',true))
-    + '</div><div class="calendar-gap"></div>'
-    + table('Статьи',['Название','Направление',''],articles,'Статей пока нет.',button('+ Статья','article',true))
-    + '<div class="calendar-gap"></div>' + table('Юридические лица',['Название',''],companies);
+    + '</div><div class="calendar-gap"></div>' + table('Юридические лица',['Название',''],companies);
 }
 
 function render() {
   const allowed = key => key === 'users' ? data.role === 'owner' : key === 'manager-finances' ? data.role === 'manager'
     : finance() || key === 'requests';
   if (!allowed(view)) view = data.role === 'manager' ? 'manager-finances' : finance() ? 'overview' : 'requests';
-  if (view === 'profit' || view === 'pnl-template' || view === 'calendar') account = '';
+  if (view === 'profit' || view === 'calendar') account = '';
   if (view === 'month-workspace') {
     entity ||= String(legalOptions()[0][0]);
     account = '';
   }
-  nav.innerHTML = '<p class="nav-label">РАЗДЕЛЫ</p>' + tabs.filter(([key]) => allowed(key)).map(([key,icon,text]) => `<button data-action="view:${key}" class="${view === key || (key === 'profit' && view === 'pnl-template') ? 'nav-active' : ''}" ${view === key || (key === 'profit' && view === 'pnl-template') ? 'aria-current="page"' : ''}><span class="nav-icon" aria-hidden="true">${icon}</span>${text}</button>`).join('');
+  nav.innerHTML = '<p class="nav-label">РАЗДЕЛЫ</p>' + tabs.filter(([key]) => allowed(key)).map(([key,icon,text]) => `<button data-action="view:${key}" class="${view === key ? 'nav-active' : ''}" ${view === key ? 'aria-current="page"' : ''}><span class="nav-icon" aria-hidden="true">${icon}</span>${text}</button>`).join('');
   document.querySelector('#account').innerHTML = `<span class="avatar" aria-hidden="true">${esc(data.user[0])}</span><div>${esc(data.user)}<small>${roleNames[data.role]}</small></div>`;
   if (view === 'month-workspace') {
     content.innerHTML = workingMonth();
@@ -678,7 +676,6 @@ function render() {
   }
   if (view === 'cash') content.innerHTML = report('БДДС');
   if (view === 'profit') content.innerHTML = report('БДР');
-  if (view === 'pnl-template') content.innerHTML = pnlEditor();
   if (view === 'schedules') content.innerHTML = scheduleReport();
   if (view === 'requests') content.innerHTML = requests();
   if (view === 'calendar') content.innerHTML = calendar();
@@ -826,7 +823,15 @@ function allocation(op) {
     }
   });
   form.addEventListener('input',update);
-  form.addEventListener('change',update);
+  form.addEventListener('change',event => {
+    if (event.target.name === 'article') {
+      useArticleProject(event.target.value,event.target.closest('.split').querySelector('[name=project]'));
+    }
+    update();
+  });
+  for (const row of form.querySelectorAll('.split')) {
+    useArticleProject(row.querySelector('[name=article]').value,row.querySelector('[name=project]'));
+  }
   update();
 }
 
@@ -937,7 +942,7 @@ function budgetEntry(kind,basis,entry = null) {
     (accrual ? field('Описание','description','text','','required maxlength="200"') : `<small>Сценарий «${esc(selectedScenario)}»</small>`)
     + selectField('ООО','entity',legalOptions(),entry?.entity ?? entity)
     + `<div class="fields">${selectField('Вид строки','direction',directions,entry?.amount < 0 ? 'expense' : 'income')}
-    ${picker('Проект','project',activeProjects(),entry?.project ?? project)}${selectField('Статья','article',[])}
+    ${selectField('Проект','project',[['','Выберите проект'],...activeProjects().map(name => [name,name])],entry?.project ?? project)}${selectField('Статья','article',[])}
     ${field('Месяц','month','month',entry?.month || period,'required')}
     ${field('Сумма, ₽','amount','number',entry ? Math.abs(entry.amount) / 100 : '','step="0.01" min="0.01" required')}</div>`,
   values => api(kind,{
@@ -945,15 +950,17 @@ function budgetEntry(kind,basis,entry = null) {
     amount:(values.get('direction') === 'expense' ? '-' : '') + values.get('amount')
   }));
   const update = (initial = null) => {
-    form.elements.article.innerHTML = idOptions(articlesFor(form.elements.direction.value,isPnl).map(name => [name,name]),initial);
+    form.elements.article.innerHTML = idOptions([['','Выберите статью'],
+      ...articlesFor(form.elements.direction.value,isPnl).map(name => [name,name])],initial || '');
   };
   form.elements.direction.onchange = () => update();
+  form.elements.article.onchange = () => useArticleProject(form.elements.article.value,form.elements.project);
   update(entry?.article);
 }
 
 function doAction(action) {
   const [kind,arg] = action.split(':');
-  if (handlePnlAction(kind,arg) || handleScheduleAction(kind,arg) || releaseAction(kind,arg) || workspaceAction(kind,arg)
+  if (handlePnlAction(kind,arg) || articleTreeAction(kind,arg) || handleScheduleAction(kind,arg) || releaseAction(kind,arg) || workspaceAction(kind,arg)
     || (view === 'month-workspace' && workingMonthAction(kind,arg))) return;
   if (kind === 'view') {
     if (view === 'operations' && arg !== view) selectedOperations.clear();
@@ -968,8 +975,6 @@ function doAction(action) {
   const category = articles => selectField('ООО','entity',legalOptions(),entity) + `<div class="fields">${picker('Проект','project',activeProjects(),project)}${picker('Статья','article',articles)}</div>`;
   const save = (title,fields) => modal(title,fields,values => api(kind,{...Object.fromEntries(values),basis:arg,scenario}));
   if (kind === 'project') save('Новый проект',field('Название проекта','name','text','','maxlength="100" required'));
-  if (kind === 'article') save('Новая статья',field('Название статьи','name','text','','maxlength="100" required')
-    + selectField('Направление','direction',[['income','Поступления'],['expense','Расходы']]));
   if (kind === 'client') save('Новый клиент',field('Название клиента','name','text','','maxlength="100" required'));
   if (kind === 'allocate') allocation(data.operations.find(op => op.id === Number(arg)));
   if (kind === 'batch-allocate') openBatchAllocation();
@@ -1143,7 +1148,8 @@ content.addEventListener('change',event => {
   if (id === 'version') version = value;
   if (id === 'operationFilter') operationFilter = value;
   if (id === 'operationDirection') operationDirection = value;
-  if (['period','project','scenario','operationFilter','operationDirection','entity','bankAccount','version'].includes(id)) render();
+  if (id === 'reportArticleGroup') reportArticleGroup = value;
+  if (['period','project','scenario','operationFilter','operationDirection','entity','bankAccount','version','reportArticleGroup'].includes(id)) render();
 });
 
 content.addEventListener('input',event => {

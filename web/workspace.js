@@ -6,7 +6,7 @@ function directoryControls(category,name,index) {
   const archived = (category === 'projects' ? data.archivedProjects : data.archivedArticles).includes(name);
   const used = data.directoryUsed[category].includes(name);
   const id = category + '-' + index;
-  return (category === 'articles' && !used ? button('Изменить','directory-edit:' + id) + ' ' : '')
+  return (category === 'articles' && !used ? button('Название и вид','directory-edit:' + id) + ' ' : '')
     + (archived ? button('Восстановить','directory-restore:' + id) : button('В архив','directory-archive:' + id))
     + (!used ? ' ' + button('Удалить','directory-delete:' + id) : '');
 }

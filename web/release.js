@@ -65,12 +65,17 @@ async function exportReport() {
     const indices = headings.flatMap((node,index) => node.innerText ? [index] : []);
     return [{heading,rows:[
       indices.map(i => headings[i].innerText),
-      ...[...section.querySelectorAll('tbody tr')].map(row => indices.map(i => parse(row.cells[i])))
+      ...[...section.querySelectorAll('tbody tr')].map(row => indices.map(i => {
+        if (i === 0 && row.hasAttribute('data-tree-depth')) {
+          return '  '.repeat(Number(row.dataset.treeDepth)) + row.cells[i].textContent.trim();
+        }
+        return parse(row.cells[i]);
+      }))
     ]}];
   });
   const selected = id => content.querySelector('#' + id)?.selectedOptions[0]?.textContent;
   const scope = [period,entity ? entityName(Number(entity)) : 'Все ООО',view === 'cash' && account ? bankName(Number(account)) : '',
-    project || 'Все проекты',selected('scenario'),selected('version')].filter(Boolean).join(' · ');
+    project || 'Все проекты',selected('scenario'),selected('version'),selected('reportArticleGroup')].filter(Boolean).join(' · ');
   try {
     const response = await fetch('/api/export-report',{method:'POST',headers:{'Content-Type':'application/json'},
       body:JSON.stringify({report:view,scope,sheets})});

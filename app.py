@@ -66,6 +66,10 @@ def init():
           id INTEGER PRIMARY KEY, name TEXT NOT NULL UNIQUE,
           direction TEXT NOT NULL CHECK(direction IN ('income','expense','both'))
         );
+        CREATE TABLE IF NOT EXISTS article_groups (
+          id INTEGER PRIMARY KEY, name TEXT NOT NULL,
+          parent INTEGER REFERENCES article_groups(id) ON DELETE RESTRICT
+        );
         CREATE TABLE IF NOT EXISTS pnl_template (
           id INTEGER PRIMARY KEY CHECK(id=1), revision INTEGER NOT NULL, body TEXT NOT NULL
         );
@@ -218,6 +222,8 @@ def init():
         for table, column, definition in (
             ("projects", "archived", "INTEGER NOT NULL DEFAULT 0"),
             ("articles", "archived", "INTEGER NOT NULL DEFAULT 0"),
+            ("articles", "group_id", "INTEGER REFERENCES article_groups(id) ON DELETE RESTRICT"),
+            ("articles", "default_project", "TEXT REFERENCES projects(name) ON DELETE RESTRICT"),
             ("forecast_entries", "project", "TEXT"),
             ("accounts", "bank_key", "TEXT"),
             ("operations", "account", "INTEGER REFERENCES accounts(id)"),
@@ -245,6 +251,10 @@ def init():
             db.execute("INSERT INTO qodex_settings VALUES('directory_initialized')")
         user_accounts.initialize(db, USERS)
         pnl_template.initialize(db, pnl_articles(DEFAULT_ARTICLES))
+        if not db.execute("SELECT 1 FROM qodex_settings WHERE key='article_tree_initialized'").fetchone():
+            directory_admin.initialize_groups(db)
+            pnl_template.add_after_profit_block(db)
+            db.execute("INSERT INTO qodex_settings VALUES('article_tree_initialized')")
         db.execute("CREATE UNIQUE INDEX IF NOT EXISTS accounts_bank_key ON accounts(bank_key)")
         db.execute("UPDATE operations SET account=CASE WHEN ref IN ('demo-1','demo-2') THEN 2 ELSE 1 END "
                    "WHERE account IS NULL AND ref LIKE 'demo-%'")
@@ -316,6 +326,20 @@ def ensure_article(db, article, amount, accrual=False, allow_archived=False):
         raise ValueError("Выберите статью для поступления." if amount > 0 else "Выберите статью для расхода.")
     if accrual and article in (*NON_OPERATING, *CASH_STAGES):
         raise ValueError("Для БДР выберите статью начисления, например «Выручка по проекту».")
+
+
+def classify_article(db, name, payload):
+    row = db.execute("SELECT default_project FROM articles WHERE name=?", (name,)).fetchone()
+    if row is None:
+        raise ValueError("Статья не найдена.")
+    group = directory_admin.group_id(db, payload.get("group"))
+    project = payload.get("defaultProject") or None
+    if project:
+        ensure_project(db, project, allow_archived=project == row["default_project"])
+    if any(key in payload for key in ("revision", "projectBlock", "officeBlock")):
+        directions = {row["name"]: row["direction"] for row in db.execute("SELECT name,direction FROM articles")}
+        pnl_template.assign_article(db, name, payload, pnl_articles(directions))
+    db.execute("UPDATE articles SET group_id=?,default_project=? WHERE name=?", (group, project, name))
 
 
 def directory_name(db, table, raw, limit=100):
@@ -1083,6 +1107,11 @@ def mutate(db, action, payload, actor, role):
         name = payload["name"].strip()
         directory_admin.edit_article(db, payload["current"], name, payload["direction"])
         target = f'{payload["current"]}:{name}'
+    elif action == "article-classification":
+        target = payload["article"]
+        classify_article(db, target, payload)
+    elif action in ("article-group", "article-group-delete"):
+        target = str(directory_admin.change_group(db, action, payload))
     elif action == "directory-change":
         directory_admin.change(db, payload["category"], payload["name"], payload["mode"])
         target = f'{payload["category"]}:{payload["name"]}:{payload["mode"]}'
@@ -1097,6 +1126,8 @@ def mutate(db, action, payload, actor, role):
         if name.casefold() in ("без распределения", "между счетами", "между ооо"):
             raise ValueError("Это название используется в банковских отчётах.")
         target = str(db.execute("INSERT INTO articles(name,direction) VALUES(?,?)", (name, direction)).lastrowid)
+        if any(key in payload for key in ("group", "defaultProject", "revision", "projectBlock", "officeBlock")):
+            classify_article(db, name, payload)
     elif action == "client":
         target = str(add_client(db, payload["name"]))
     elif action == "fund":
@@ -1513,6 +1544,9 @@ class Handler(BaseHTTPRequestHandler):
                     data["client_payers"] = [dict(row) for row in db.execute("SELECT DISTINCT client,payer FROM client_payers")]
                     data["profit_decisions"] = profit_decision_rows(db)
                     data["pnlTemplate"] = pnl_template.read(db)
+                    data["articleGroups"] = [dict(row) for row in db.execute("SELECT * FROM article_groups ORDER BY id")]
+                    data["articleMeta"] = {row["name"]: {"group": row["group_id"], "project": row["default_project"]}
+                                           for row in db.execute("SELECT name,group_id,default_project FROM articles")}
                     data["periodClosures"] = [
                         {**dict(row), "checks": json.loads(row["checks"])}
                         for row in db.execute("SELECT * FROM period_closures ORDER BY month DESC,entity")
@@ -1563,7 +1597,8 @@ class Handler(BaseHTTPRequestHandler):
                 return self.reply(200, data)
         assets = {"/": ("index.html", "text/html"), "/style.css": ("style.css", "text/css"), "/app.js": ("app.js", "text/javascript"), "/pnl.js": ("pnl.js", "text/javascript"),
                   "/schedules.js": ("schedules.js", "text/javascript"), "/release.js": ("release.js", "text/javascript"),
-                  "/workspace.js": ("workspace.js", "text/javascript"), "/month.js": ("month.js", "text/javascript")}
+                  "/workspace.js": ("workspace.js", "text/javascript"), "/month.js": ("month.js", "text/javascript"),
+                  "/articles.js": ("articles.js", "text/javascript")}
         if path in assets:
             filename, mime = assets[path]
             return self.send_data(200, (ROOT / "web" / filename).read_bytes(), mime + "; charset=utf-8")

@@ -8,6 +8,7 @@ TABLES = {
         ("bank_rules", "project"), ("accrual_schedules", "project"), ("balances", "project"),
         ("office_contributions", "project"), ("forecast_entries", "project"),
         ("monthly_rules", "project"), ("bonus_confirmations", "project"), ("weekly_actions", "project"),
+        ("articles", "default_project"),
     ),
     "articles": (
         ("allocations", "article"), ("allocations", "accrual_article"), ("accruals", "article"),
@@ -16,6 +17,58 @@ TABLES = {
     ),
 }
 PROTECTED = {"projects": {"Офис"}, "articles": {"Финансирование", "Дивиденды"}}
+
+
+def initialize_groups(db):
+    defaults = {
+        "Выручка": ("Лицензии", "Услуги", "Выручка по проекту"),
+        "Зарплата": ("ФОТ",),
+        "Офис": ("Офисные расходы",),
+        "Финансирование и дивиденды": ("Финансирование", "Дивиденды"),
+    }
+    for name, articles in defaults.items():
+        group = db.execute("INSERT INTO article_groups(name) VALUES(?)", (name,)).lastrowid
+        db.executemany("UPDATE articles SET group_id=? WHERE name=? AND group_id IS NULL",
+                       ((group, article) for article in articles))
+
+
+def group_id(db, value):
+    if value in (None, ""):
+        return None
+    group = int(value)
+    if not db.execute("SELECT 1 FROM article_groups WHERE id=?", (group,)).fetchone():
+        raise ValueError("Выберите группу из справочника.")
+    return group
+
+
+def change_group(db, action, payload):
+    group = group_id(db, payload.get("id"))
+    if action == "article-group-delete":
+        if group is None:
+            raise ValueError("Выберите группу.")
+        if db.execute("SELECT 1 FROM article_groups WHERE parent=? UNION ALL SELECT 1 FROM articles WHERE group_id=?",
+                      (group, group)).fetchone():
+            raise ValueError("Перенесите статьи и подгруппы перед удалением группы.")
+        db.execute("DELETE FROM article_groups WHERE id=?", (group,))
+        return group
+    name = payload["name"].strip()
+    parent = group_id(db, payload.get("parent"))
+    if not name or len(name) > 80:
+        raise ValueError("Введите название группы до 80 символов.")
+    siblings = db.execute("SELECT id,name FROM article_groups WHERE parent IS ?", (parent,)).fetchall()
+    if any(row["id"] != group and row["name"].casefold() == name.casefold() for row in siblings):
+        raise ValueError("В этом разделе уже есть группа с таким названием.")
+    if group is None:
+        return db.execute("INSERT INTO article_groups(name,parent) VALUES(?,?)", (name, parent)).lastrowid
+    if db.execute("""
+        WITH RECURSIVE ancestors(id,parent) AS (
+          SELECT id,parent FROM article_groups WHERE id=?
+          UNION ALL SELECT g.id,g.parent FROM article_groups g JOIN ancestors a ON a.parent=g.id
+        ) SELECT 1 FROM ancestors WHERE id=?
+    """, (parent, group)).fetchone():
+        raise ValueError("Выберите группу вне этой ветки дерева.")
+    db.execute("UPDATE article_groups SET name=?,parent=? WHERE id=?", (name, parent, group))
+    return group
 
 
 def used_names(db, category):

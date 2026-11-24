@@ -3,12 +3,13 @@
 import json
 import re
 
-STAGES = {"revenue", "direct", "project", "office"}
+STAGES = {"revenue", "direct", "project", "office", "after"}
 DEFAULT_BLOCKS = [
     {"id": "revenue", "stage": "revenue", "name": "Выручка проектов"},
     {"id": "direct", "stage": "direct", "name": "Прямые затраты"},
     {"id": "project", "stage": "project", "name": "Прочие расходы проектов"},
     {"id": "office", "stage": "office", "name": "Доходы и расходы офиса"},
+    {"id": "after-profit", "stage": "after", "name": "Премии, маркетинг и развитие"},
 ]
 DIRECT_ARTICLES = {"Разработка", "Дизайн", "ФОТ", "Инфраструктура", "Поддержка",
                    "Прямые расходы на клиентов", "Услуги поставщиков"}
@@ -30,6 +31,25 @@ def initialize(db, articles):
 def read(db):
     row = db.execute("SELECT revision,body FROM pnl_template WHERE id=1").fetchone()
     return {"revision": row["revision"], **json.loads(row["body"])}
+
+
+def add_after_profit_block(db):
+    current = read(db)
+    if any(block["stage"] == "after" for block in current["blocks"]):
+        return
+    if len(current["blocks"]) >= 60:
+        return
+    ids = {block["id"] for block in current["blocks"]}
+    names = {block["name"].casefold() for block in current["blocks"]}
+    default = DEFAULT_BLOCKS[-1]
+    block = dict(default)
+    suffix = 2
+    while block["id"] in ids or block["name"].casefold() in names:
+        block = {**default, "id": f"after-profit-{suffix}", "name": f"{default['name']} ({suffix})"}
+        suffix += 1
+    current["blocks"].append(block)
+    db.execute("UPDATE pnl_template SET revision=revision+1,body=? WHERE id=1",
+               (json.dumps({key: current[key] for key in ("blocks", "assignments")}, ensure_ascii=False),))
 
 
 def validate(payload, articles):
@@ -54,8 +74,9 @@ def validate(payload, articles):
         stage = by_id.get(block_id, {}).get("stage")
         if article not in articles or scope not in ("office", "project") or stage is None:
             raise ValueError("Проверьте привязку статьи к блоку.")
-        expected = {"office"} if scope == "office" else (
-            {"revenue"} if articles[article] == "income" else {"direct", "project"})
+        income = articles[article] == "income"
+        expected = ({"office"} if income else {"office", "after"}) if scope == "office" else (
+            {"revenue"} if income else {"direct", "project", "after"})
         if stage not in expected or (article, scope) in routes:
             raise ValueError(f'Для статьи «{article}» выберите один подходящий блок в каждом разрезе.')
         routes[article, scope] = {"article": article, "scope": scope, "block": block_id}
@@ -71,3 +92,16 @@ def save(db, payload, articles):
     if not row:
         raise ValueError("Шаблон уже обновили. Откройте последнюю версию и повторите изменения.")
     return row["revision"]
+
+
+def assign_article(db, article, payload, articles):
+    current = read(db)
+    old = {entry["scope"]: entry["block"] for entry in current["assignments"] if entry["article"] == article}
+    requested = {scope: payload[key] for scope, key in (("project", "projectBlock"), ("office", "officeBlock")) if payload.get(key)}
+    if current["revision"] != int(payload["revision"]):
+        raise ValueError("Разделы БДР изменились. Обновите справочник и повторите настройку.")
+    if old == requested:
+        return
+    remaining = [entry for entry in current["assignments"] if entry["article"] != article]
+    remaining.extend({"article": article, "scope": scope, "block": block} for scope, block in requested.items())
+    save(db, {**current, "assignments": remaining}, articles)
