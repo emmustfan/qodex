@@ -62,11 +62,15 @@ def protect_last_owner(db, old, new_role, new_active):
             raise ValueError("Оставьте хотя бы одного действующего владельца.")
 
 
+def valid_login(login):
+    return login != DEMO_NAME and bool(re.fullmatch(r"[^\s:\x00-\x1f\x7f]{1,150}", login))
+
+
 def change(db, action, payload, proxy):
     login = payload["login"].strip()
     old = db.execute("SELECT * FROM workspace_users WHERE login=?", (login,)).fetchone()
     if action == "user-save":
-        if not old and (not re.fullmatch(r"[^\s:\x00-\x1f\x7f]{1,150}", login) or login == DEMO_NAME):
+        if not old and not valid_login(login):
             raise ValueError("Укажите логин до 150 символов без пробелов и двоеточий.")
         role = payload["role"]
         if role not in ROLES:

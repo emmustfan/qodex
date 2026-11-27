@@ -1,0 +1,6 @@
+.vercel/
+data/
+**/*.sqlite3*
+.env*
+**/.env*
+**/__pycache__/

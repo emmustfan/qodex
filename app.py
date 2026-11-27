@@ -7,6 +7,7 @@ import os
 import sqlite3
 from base64 import b64decode
 from contextlib import closing
+from contextvars import ContextVar
 from datetime import date
 from decimal import Decimal, InvalidOperation
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -24,6 +25,7 @@ import month_workspace
 
 ROOT = Path(__file__).resolve().parent
 DB = Path(os.environ.get("QODEX_DB", ROOT / "data" / "finance.sqlite3"))
+request_database = ContextVar("request_database", default=None)
 USERS_FILE = os.environ.get("QODEX_USERS_FILE")
 USERS = json.loads(Path(USERS_FILE).read_text(encoding="utf-8") if USERS_FILE else os.environ.get("QODEX_USERS", "{}"))
 PROXY_TOKEN = os.environ.get("QODEX_PROXY_TOKEN", "")
@@ -39,6 +41,11 @@ DEFAULT_ARTICLES = {
 }
 ENTITIES = ["ООО 1", "ООО 2"]
 SCENARIOS = ["Базовый", "Консервативный", "Оптимистичный"]
+ASSETS = {"/": ("index.html", "text/html"), "/style.css": ("style.css", "text/css"),
+          "/app.js": ("app.js", "text/javascript"), "/pnl.js": ("pnl.js", "text/javascript"),
+          "/schedules.js": ("schedules.js", "text/javascript"), "/release.js": ("release.js", "text/javascript"),
+          "/workspace.js": ("workspace.js", "text/javascript"), "/month.js": ("month.js", "text/javascript"),
+          "/articles.js": ("articles.js", "text/javascript")}
 
 
 def pnl_articles(directions):
@@ -46,14 +53,16 @@ def pnl_articles(directions):
 
 
 def connect():
-    conn = sqlite3.connect(DB, timeout=10)
+    conn = sqlite3.connect(request_database.get() or DB, timeout=10)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys = ON")
     return conn
 
 
-def init():
-    DB.parent.mkdir(parents=True, exist_ok=True)
+def init(*, seed=None, bootstrap=None):
+    (request_database.get() or DB).parent.mkdir(parents=True, exist_ok=True)
+    if seed is None:
+        seed = os.environ.get("QODEX_SEED", "1") == "1"
     with closing(connect()) as db, db:
         db.executescript("""
         CREATE TABLE IF NOT EXISTS qodex_settings (
@@ -249,7 +258,7 @@ def init():
             db.executemany("INSERT OR IGNORE INTO projects(name) VALUES(?)", [(name,) for name in SEED_PROJECTS])
             db.executemany("INSERT OR IGNORE INTO articles(name,direction) VALUES(?,?)", DEFAULT_ARTICLES.items())
             db.execute("INSERT INTO qodex_settings VALUES('directory_initialized')")
-        user_accounts.initialize(db, USERS)
+        user_accounts.initialize(db, USERS if bootstrap is None else bootstrap)
         pnl_template.initialize(db, pnl_articles(DEFAULT_ARTICLES))
         if not db.execute("SELECT 1 FROM qodex_settings WHERE key='article_tree_initialized'").fetchone():
             directory_admin.initialize_groups(db)
@@ -258,7 +267,7 @@ def init():
         db.execute("CREATE UNIQUE INDEX IF NOT EXISTS accounts_bank_key ON accounts(bank_key)")
         db.execute("UPDATE operations SET account=CASE WHEN ref IN ('demo-1','demo-2') THEN 2 ELSE 1 END "
                    "WHERE account IS NULL AND ref LIKE 'demo-%'")
-        if os.environ.get("QODEX_SEED", "1") == "1" and not db.execute("SELECT 1 FROM operations LIMIT 1").fetchone():
+        if seed and not db.execute("SELECT 1 FROM operations LIMIT 1").fetchone():
             samples = [
                 ("2026-06-02", "Лицензия · Север", 950000, 0, 0),
                 ("2026-06-04", "Поддержка · Проект 2", 480000, 1, 1),
@@ -1456,18 +1465,39 @@ def mutate(db, action, payload, actor, role):
     return result
 
 
+def read_asset(path):
+    filename, mime = ASSETS[path]
+    return (ROOT / "web" / filename).read_bytes(), mime + "; charset=utf-8"
+
+
+def response_headers(code, data, mime, filename=None, *, proxy_auth=False):
+    headers = [
+        ("Content-Type", mime), ("Content-Length", str(len(data))), ("Cache-Control", "no-store"),
+        ("X-Content-Type-Options", "nosniff"),
+        ("Content-Security-Policy", "default-src 'self'; style-src 'self' 'unsafe-inline'; frame-ancestors 'none'"),
+    ]
+    if filename:
+        headers.append(("Content-Disposition", "attachment; filename*=UTF-8''" + quote(filename, safe="")))
+    if code == 401 and not proxy_auth:
+        headers.append(("WWW-Authenticate", 'Basic realm="Qodex", charset="UTF-8"'))
+    return headers
+
+
 class Handler(BaseHTTPRequestHandler):
+    proxy_token = PROXY_TOKEN
+    allow_demo = not USERS and not USERS_FILE and not PROXY_TOKEN
+
     def identity(self):
         with closing(connect()) as db:
-            if PROXY_TOKEN:
+            if self.proxy_token:
                 supplied = self.headers.get("X-Qodex-Proxy-Token", "")
                 login = self.headers.get("X-Qodex-User", "")
-                if hmac.compare_digest(PROXY_TOKEN.encode(), supplied.encode()):
+                if hmac.compare_digest(self.proxy_token.encode(), supplied.encode()):
                     user = user_accounts.identity(db, login)
                     if user:
                         return login, user["role"]
                 return None
-            if not USERS and not USERS_FILE and not db.execute("SELECT 1 FROM workspace_users LIMIT 1").fetchone():
+            if self.allow_demo and not db.execute("SELECT 1 FROM workspace_users LIMIT 1").fetchone():
                 return user_accounts.DEMO_NAME, "finance"
             try:
                 scheme, token = self.headers.get("Authorization", "").split(" ", 1)
@@ -1481,7 +1511,7 @@ class Handler(BaseHTTPRequestHandler):
 
     def verify_role(self, db, identity):
         login, role = identity
-        if login == user_accounts.DEMO_NAME and not USERS and not USERS_FILE and not PROXY_TOKEN and not db.execute(
+        if login == user_accounts.DEMO_NAME and self.allow_demo and not db.execute(
             "SELECT 1 FROM workspace_users LIMIT 1"
         ).fetchone():
             return True
@@ -1491,15 +1521,8 @@ class Handler(BaseHTTPRequestHandler):
 
     def send_data(self, code, data, mime="application/json; charset=utf-8", filename=None):
         self.send_response(code)
-        self.send_header("Content-Type", mime)
-        self.send_header("Content-Length", str(len(data)))
-        self.send_header("Cache-Control", "no-store")
-        self.send_header("X-Content-Type-Options", "nosniff")
-        self.send_header("Content-Security-Policy", "default-src 'self'; style-src 'self' 'unsafe-inline'; frame-ancestors 'none'")
-        if filename:
-            self.send_header("Content-Disposition", "attachment; filename*=UTF-8''" + quote(filename, safe=""))
-        if code == 401 and not PROXY_TOKEN:
-            self.send_header("WWW-Authenticate", 'Basic realm="Qodex", charset="UTF-8"')
+        for key, value in response_headers(code, data, mime, filename, proxy_auth=bool(self.proxy_token)):
+            self.send_header(key, value)
         self.end_headers()
         self.wfile.write(data)
 
@@ -1595,13 +1618,8 @@ class Handler(BaseHTTPRequestHandler):
                             archivedArticles=[row["name"] for row in articles if row["archived"]],
                             scenarios=SCENARIOS, user=name, role=role, demo=not users, authProxy=bool(PROXY_TOKEN))
                 return self.reply(200, data)
-        assets = {"/": ("index.html", "text/html"), "/style.css": ("style.css", "text/css"), "/app.js": ("app.js", "text/javascript"), "/pnl.js": ("pnl.js", "text/javascript"),
-                  "/schedules.js": ("schedules.js", "text/javascript"), "/release.js": ("release.js", "text/javascript"),
-                  "/workspace.js": ("workspace.js", "text/javascript"), "/month.js": ("month.js", "text/javascript"),
-                  "/articles.js": ("articles.js", "text/javascript")}
-        if path in assets:
-            filename, mime = assets[path]
-            return self.send_data(200, (ROOT / "web" / filename).read_bytes(), mime + "; charset=utf-8")
+        if path in ASSETS:
+            return self.send_data(200, *read_asset(path))
         self.reply(404, {"error": "Страница не найдена."})
 
     def do_POST(self):

@@ -1,0 +1,14 @@
+{
+  "$schema": "https://openapi.vercel.sh/vercel.json",
+  "framework": null,
+  "functions": {
+    "api/index.py": {
+      "includeFiles": "web/**",
+      "excludeFiles": "{data/**,*.sqlite3*,**/*.sqlite3*,.env*,**/.env*,.vercel/**}",
+      "maxDuration": 30
+    }
+  },
+  "rewrites": [
+    { "source": "/:path*", "destination": "/api/index?_qodex_path=/:path*" }
+  ]
+}
