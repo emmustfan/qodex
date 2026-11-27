@@ -27,10 +27,10 @@ function workingMonth() {
   return header('Рабочий месяц','Деньги, бюджет и решения по проектам',
     button('Банковские операции','view:operations') + button(closed ? 'Месяц закрыт' : 'Проверить и закрыть',
       closed ? 'view:periods' : 'period-close:' + scope.entity, !closed))
-    + `<div class="toolbar"><input type="month" id="period" aria-label="Отчётный месяц" value="${scope.month}">
-        <select id="entity" aria-label="Юридическое лицо">${idOptions(legalOptions(),entity)}</select>
-        <select id="project" aria-label="Проект"><option value="">Все проекты</option>${options(data.projects,project)}</select>
-        <select id="scenario" aria-label="Сценарий бюджета">${options(data.scenarios,scenario)}</select></div>`
+    + `<div class="toolbar">${filterField('Период',`<input type="month" id="period" aria-label="Отчётный месяц" value="${scope.month}">`)}
+      ${filterField('ООО',`<select id="entity" aria-label="Юридическое лицо">${idOptions(legalOptions(),entity)}</select>`)}
+      ${filterField('Проект',`<select id="project" aria-label="Проект"><option value="">Все проекты</option>${options(data.projects,project)}</select>`)}
+      ${filterField('Сценарий',`<select id="scenario" aria-label="Сценарий бюджета">${options(data.scenarios,scenario)}</select>`)}</div>`
     + `<div class="month-cutoff"><label for="workingDate">Дата денежного среза</label>
         <input id="workingDate" type="date" value="${scope.day}" min="${scope.start}" max="${scope.end}">
         <div class="actions" role="group" aria-label="Концы недель">${weeks.join('')}</div></div>

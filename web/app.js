@@ -101,16 +101,27 @@ function filterRows(rows, month = period, currentProject = project) {
 }
 
 function header(title, subtitle, actions = '') {
-  return `<header class="top"><div><div class="eyebrow">${data.demo ? 'Демонстрационный режим' : 'Финансовый контур'}</div><h1>${title}</h1><p class="subtitle">${subtitle}</p></div><div class="actions">${actions}</div></header>`;
+  return `<header class="top"><div class="page-heading"><div class="page-title"><h1>${title}</h1>
+    ${data.demo ? '<span class="pill pending">Демо</span>' : ''}</div><p class="subtitle">${subtitle}</p></div>
+    ${actions ? `<div class="actions">${actions}</div>` : ''}</header>`;
 }
 
 const idOptions = (items, current) => items.map(([id,label]) => `<option value="${esc(id)}" ${String(id) === String(current) ? 'selected' : ''}>${esc(label)}</option>`).join('');
 const legalOptions = () => data.entities.map((name,index) => [index + 1,name]);
 const accountOptions = () => data.accounts.filter(item => inEntity(item.entity)).map(item => [item.id,bankName(item.id)]);
 const selectField = (label,name,items,current,required = true) => `<label>${label}<select name="${name}" aria-label="${esc(label)}" ${required ? 'required' : ''}>${idOptions(items,current)}</select></label>`;
+const filterField = (label,control) => `<label class="filter-field"><span>${label}</span>${control}</label>`;
 
-function filters(withScenario = false, operations = false, showAccount = true) {
-  return `<div class="toolbar"><input type="month" aria-label="Отчётный месяц" id="period" value="${period}"><select id="project" aria-label="Проект"><option value="">Все проекты</option>${options(data.projects,project)}</select><select id="entity" aria-label="Юридическое лицо"><option value="">Все ООО</option>${idOptions(legalOptions(),entity)}</select>${showAccount ? `<select id="bankAccount" aria-label="Банковский счёт"><option value="">Все счета</option>${idOptions(accountOptions(),account)}</select>` : ''}${withScenario ? `<select id="scenario" aria-label="Сценарий бюджета">${options(data.scenarios,scenario)}</select>` : ''}${operations ? `<select id="operationDirection" aria-label="Вид операции"><option value="">Поступления и расходы</option>${idOptions([['income','Поступления'],['expense','Расходы']],operationDirection)}</select><select id="operationFilter" aria-label="Статус распределения"><option value="all">Все операции</option><option value="pending" ${operationFilter === 'pending' ? 'selected' : ''}>Без распределения</option><option value="documents" ${operationFilter === 'documents' ? 'selected' : ''}>Ждём документы</option></select>` : ''}</div>`;
+function filters(withScenario = false, operations = false, showAccount = true, extra = '') {
+  return `<div class="toolbar">
+    ${filterField('Период',`<input type="month" aria-label="Отчётный месяц" id="period" value="${period}">`)}
+    ${filterField('Проект',`<select id="project" aria-label="Проект"><option value="">Все проекты</option>${options(data.projects,project)}</select>`)}
+    ${filterField('ООО',`<select id="entity" aria-label="Юридическое лицо"><option value="">Все ООО</option>${idOptions(legalOptions(),entity)}</select>`)}
+    ${showAccount ? filterField('Счёт',`<select id="bankAccount" aria-label="Банковский счёт"><option value="">Все счета</option>${idOptions(accountOptions(),account)}</select>`) : ''}
+    ${withScenario ? filterField('Сценарий',`<select id="scenario" aria-label="Сценарий бюджета">${options(data.scenarios,scenario)}</select>`) : ''}
+    ${operations ? filterField('Вид операции',`<select id="operationDirection" aria-label="Вид операции"><option value="">Поступления и расходы</option>${idOptions([['income','Поступления'],['expense','Расходы']],operationDirection)}</select>`)
+      + filterField('Разнесение',`<select id="operationFilter" aria-label="Статус распределения"><option value="all">Все операции</option><option value="pending" ${operationFilter === 'pending' ? 'selected' : ''}>Без распределения</option><option value="documents" ${operationFilter === 'documents' ? 'selected' : ''}>Ждём документы</option></select>`) : ''}
+    ${extra}</div>`;
 }
 
 function chart(rows) {
@@ -286,13 +297,13 @@ function overview() {
 
 function report(basis) {
   const cash = basis === 'БДДС';
-  const groupFilter = reportGroupFilter();
+  const groupFilter = filterField('Группа статей',reportGroupFilter());
   const grouped = Boolean(reportArticleGroup);
   const fact = filterArticleGroups(filterRows(cash ? cashRows() : profitRows()));
   if (cash && account) {
     const actual = totals(fact);
     return header('БДДС',esc(bankName(Number(account))) + ' · факт по датам платежей',button('Справочник статей','article-directory') + button('Экспорт Excel','export-report'))
-      + filters() + `<div class="toolbar">${groupFilter}</div>` + closeBadge()
+      + filters(false,false,true,groupFilter) + closeBadge()
       + `<div class="metrics">${card('Чистый денежный поток',rub(actual.net),'Факт за месяц')}${card('Поступления',rub(actual.incoming),'Факт за месяц')}${card('Выплаты',rub(actual.outgoing),'Факт за месяц')}</div>`
       + financialTree('Движение по группам статей',groupedArticleNodes(reportEntries([],fact)),'cash-account','fact');
   }
@@ -304,7 +315,7 @@ function report(basis) {
   const saved = versions.find(item => item.id === Number(version));
   if (saved) budget = filterRows(saved.rows.filter(row => inEntity(row.entity)));
   budget = filterArticleGroups(budget);
-  const versionFilter = `<div class="toolbar">${groupFilter}<select id="version" aria-label="Версия плана"><option value="">Текущий план</option>${idOptions(versions.map(item => [item.id,item.name]),version)}</select></div>`;
+  const versionFilter = filterField('Версия плана',`<select id="version" aria-label="Версия плана"><option value="">Текущий план</option>${idOptions(versions.map(item => [item.id,item.name]),version)}</select>`);
   const planActions = saved ? '' : button('+ Строка плана','plan:' + basis,true) + button('Зафиксировать план','freeze-budget:' + basis);
   const structure = cash || grouped ? null : pnlStructure(budget,fact);
   const flat = Boolean(structure && pnlMode === 'articles');
@@ -318,7 +329,7 @@ function report(basis) {
   const resultLabel = grouped ? 'Сальдо по группе' : cash ? 'Чистый денежный поток' : 'Операционный результат';
   const lastCard = structure ? card('Скорректированный доход проектов',rub(structure.adjusted),`Маржа ${pnlPercent(structure.margin)}`)
     : card('Отклонение',rub(actual.net-planned.net),'Факт минус план');
-  return header(cash ? 'БДДС' : 'БДР / P&L',cash ? 'План и факт по датам платежей' : 'План и факт по месяцам начисления',planActions + (cash ? '' : button('+ Начисление','accrual') + button('Распределение прибыли','view:distribution') + button('Графики начислений','view:schedules') + switchView) + button('Справочник статей','article-directory') + button('Экспорт Excel','export-report')) + filters(true,false,cash) + versionFilter + closeBadge()
+  return header(cash ? 'БДДС' : 'БДР / P&L',cash ? 'План и факт по датам платежей' : 'План и факт по месяцам начисления',planActions + (cash ? '' : button('+ Начисление','accrual') + button('Распределение прибыли','view:distribution') + button('Графики начислений','view:schedules') + switchView) + button('Справочник статей','article-directory') + button('Экспорт Excel','export-report')) + filters(true,false,cash,groupFilter + versionFilter) + closeBadge()
     + `<div class="metrics">${card(resultLabel,rub(actual.net),`План ${rub(planned.net)}`)}${card(cash ? 'Поступления' : 'Доходы',rub(actual.incoming),`План ${rub(planned.incoming)}`)}${card(cash ? 'Выплаты' : 'Расходы',rub(actual.outgoing),`План ${rub(planned.outgoing)}`)}${lastCard}</div>`
     + financialTree(tableTitle,nodes,basis)
     + (extras ? '<div class="calendar-gap"></div>' + extras : '');
@@ -407,7 +418,8 @@ function forecast() {
   const items = [...manual].sort((a,b) => a.day.localeCompare(b.day) || a.id-b.id).map(item =>
     `<tr><td>${esc(item.day)}</td><td>${esc(entityName(item.entity))}</td><td class="wrap">${esc(item.description)}<small>${esc(item.project || 'Компания')}</small></td><td>${rub(item.amount)}</td><td>${button('Удалить','remove-forecast:' + item.id)}</td></tr>`);
   return header('Прогноз денег','Факт по счетам на сегодня, ожидаемые операции и остатки заявок',button('+ Ожидаемая операция','forecast',true))
-    + `<div class="toolbar"><input type="month" aria-label="Горизонт прогноза" id="period" min="${today.slice(0,7)}" value="${horizon}"><select id="entity" aria-label="Юридическое лицо"><option value="">Все ООО</option>${idOptions(legalOptions(),entity)}</select></div>
+    + `<div class="toolbar">${filterField('До конца месяца',`<input type="month" aria-label="Горизонт прогноза" id="period" min="${today.slice(0,7)}" value="${horizon}">`)}
+      ${filterField('ООО',`<select id="entity" aria-label="Юридическое лицо"><option value="">Все ООО</option>${idOptions(legalOptions(),entity)}</select>`)}</div>
       <div class="metrics">${card('Остаток на сегодня',formats(initial),known ? 'С учётом банковских операций' : 'Проверьте входящие остатки и счета')}${card('Остаток на конец периода',formats(running),`Горизонт ${horizon}`)}${card('Минимальный остаток',formats(minimum),minimum < 0 ? 'Прогнозируется кассовый разрыв' : 'На горизонте прогноза')}${card('К оплате по заявкам',rub(totals(obligations).outgoing),'Только неоплаченные суммы')}</div>`
     + table('Остаток по дням',['Дата','Поступления','Выплаты','Остаток'],rows,'Ожидаемых движений до конца периода нет.')
     + '<div class="calendar-gap"></div>'
@@ -455,8 +467,8 @@ function payments(item, profit = false) {
 }
 
 function entityPeriodFilters() {
-  return `<div class="toolbar"><input type="month" aria-label="Отчётный месяц" id="period" value="${period}">
-    <select id="entity" aria-label="Юридическое лицо"><option value="">Все ООО</option>${idOptions(legalOptions(),entity)}</select></div>`;
+  return `<div class="toolbar">${filterField('Период',`<input type="month" aria-label="Отчётный месяц" id="period" value="${period}">`)}
+    ${filterField('ООО',`<select id="entity" aria-label="Юридическое лицо"><option value="">Все ООО</option>${idOptions(legalOptions(),entity)}</select>`)}</div>`;
 }
 
 function fundsReport() {
@@ -624,9 +636,9 @@ function accountReport() {
       <td><span class="pill ${status === 'Есть расхождения' ? 'pending' : ''}">${status}</span></td></tr>`;
   });
   return header('Банковские счета','Остатки, обороты и сверка с выписками',button('+ Счёт','account',true))
-    + `<div class="toolbar"><input type="month" aria-label="Отчётный месяц" id="period" value="${period}">
-       <select id="entity" aria-label="Юридическое лицо"><option value="">Все ООО</option>${idOptions(legalOptions(),entity)}</select>
-       <select id="bankAccount" aria-label="Банковский счёт"><option value="">Все счета</option>${idOptions(accountOptions(),account)}</select></div>`
+    + `<div class="toolbar">${filterField('Период',`<input type="month" aria-label="Отчётный месяц" id="period" value="${period}">`)}
+      ${filterField('ООО',`<select id="entity" aria-label="Юридическое лицо"><option value="">Все ООО</option>${idOptions(legalOptions(),entity)}</select>`)}
+      ${filterField('Счёт',`<select id="bankAccount" aria-label="Банковский счёт"><option value="">Все счета</option>${idOptions(accountOptions(),account)}</select>`)}</div>`
     + table('Сверка за месяц',['Счёт',...Object.values(titles),'Статус',''],rows,'В выбранном разрезе счетов нет.')
     + (imports.length ? '<div class="calendar-gap"></div>'
       + table('Загруженные выписки Точки',['Счёт','Период',...Object.values(titles),'Статус'],imports) : '');
@@ -635,7 +647,7 @@ function accountReport() {
 function directories() {
   const names = data.projects.map((name,index) => `<tr><td>${esc(name)}${data.archivedProjects.includes(name) ? '<small>В архиве</small>' : ''}
     ${data.projectParents[name] || data.licenseUnits[name] ? `<small>${esc([data.projectParents[name],data.licenseUnits[name] && 'Единица лицензии — ' + data.licenseUnits[name]].filter(Boolean).join(' · '))}</small>` : ''}</td>
-    <td>${directoryControls('projects',name,index)}</td></tr>`);
+    <td><div class="actions directory-actions">${directoryControls('projects',name,index)}</div></td></tr>`);
   const payers = Map.groupBy(data.client_payers,row => row.client);
   const receipts = Map.groupBy(data.operations.filter(op => op.amount > 0 && op.client),op => op.client);
   const clients = data.clients.map(item => {
@@ -646,7 +658,7 @@ function directories() {
   const companies = legalOptions().map(([id,label]) =>
     `<tr><td>${esc(label)}</td><td>${button('Переименовать','rename-entity:' + id)}</td></tr>`);
   return header('Справочники','Проекты, статьи и основные клиенты') + '<div class="directory-grid">'
-    + table('Проекты',['Название',''],names,'Проектов пока нет.',button('+ Проект','project',true))
+    + `<div class="directory-projects">${table('Проекты',['Название','Действия'],names,'Проектов пока нет.',button('+ Проект','project',true))}</div>`
     + table('Клиенты',['Основной клиент','Плательщики из поступлений'],clients,'Добавьте клиента здесь или в карточке поступления.',button('+ Клиент','client',true))
     + '</div><div class="calendar-gap"></div>' + articleDirectory()
     + '<div class="calendar-gap"></div>' + table('Юридические лица',['Название',''],companies);
@@ -661,8 +673,8 @@ function render() {
     entity ||= String(legalOptions()[0][0]);
     account = '';
   }
-  nav.innerHTML = '<p class="nav-label">РАЗДЕЛЫ</p>' + tabs.filter(([key]) => allowed(key)).map(([key,icon,text]) => `<button data-action="view:${key}" class="${view === key ? 'nav-active' : ''}" ${view === key ? 'aria-current="page"' : ''}><span class="nav-icon" aria-hidden="true">${icon}</span>${text}</button>`).join('');
-  document.querySelector('#account').innerHTML = `<span class="avatar" aria-hidden="true">${esc(data.user[0])}</span><div>${esc(data.user)}<small>${roleNames[data.role]}</small></div>`;
+  nav.innerHTML = tabs.filter(([key]) => allowed(key)).map(([key,icon,text]) => `<button data-action="view:${key}" class="${view === key ? 'nav-active' : ''}" ${view === key ? 'aria-current="page"' : ''}><span class="nav-icon" aria-hidden="true">${icon}</span>${text}</button>`).join('');
+  document.querySelector('#account').innerHTML = `<span class="avatar" aria-hidden="true">${esc(data.user[0])}</span><div class="account-user">${esc(data.user)}<small>${roleNames[data.role]}</small></div>`;
   if (view === 'month-workspace') {
     content.innerHTML = workingMonth();
     loadWorkingMonth();
@@ -671,10 +683,11 @@ function render() {
   if (view === 'operations') {
     const count = bankSuggestions().length;
     const suggestion = count ? button(`Подсказки (${count})`,'bank-suggestions') : '';
+    const search = filterField('Поиск',`<input type="search" id="operationSearch" aria-label="Поиск по назначению, контрагенту или клиенту"
+      placeholder="Назначение, контрагент или клиент" value="${esc(operationSearch)}">`);
     content.innerHTML = header('Операции','Банковская выписка и распределение по проектам',
-      suggestion + button('Связать перевод','transfer') + button('↑ Импорт выписки','import',true)) + filters(false,true)
-      + `<div class="toolbar operation-search"><input type="search" id="operationSearch" aria-label="Поиск по назначению, контрагенту или клиенту"
-        placeholder="Назначение, контрагент или клиент" value="${esc(operationSearch)}"></div><div id="operationList"></div>`;
+      suggestion + button('Связать перевод','transfer') + button('↑ Импорт выписки','import',true)) + filters(false,true,true,search)
+      + '<div id="operationList"></div>';
     renderOperationList();
   }
   if (view === 'cash') content.innerHTML = report('БДДС');
