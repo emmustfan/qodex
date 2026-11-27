@@ -55,7 +55,10 @@ def state_snapshot(pg, write):
 
 
 def run_with_database(request, action, write):
-    url = os.environ.get("DATABASE_URL") or os.environ.get("POSTGRES_URL")
+    url = (
+        os.environ.get("DATABASE_URL") or os.environ.get("POSTGRES_URL")
+        or os.environ.get("QODEXTECH_DATABASE_URL") or os.environ.get("QODEXTECH_POSTGRES_URL")
+    )
     if not url:
         raise ConfigurationError("Подключите постоянную базу Neon к проекту Vercel.")
     sslmode = conninfo_to_dict(url).get("sslmode", "require")
