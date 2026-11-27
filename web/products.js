@@ -1,4 +1,4 @@
-const productPlanStart = '2026-12';
+const productPlanStart = '2026-11';
 
 function projectAncestors(name) {
   const path = [name];
@@ -22,7 +22,7 @@ function productStructureSetup() {
       project = '';
       version = '';
       view = 'profit';
-      return 'Структура продуктов готова. Открыт БДР за декабрь.';
+      return 'Структура продуктов готова. Открыт БДР за ноябрь.';
     });
   form.querySelector('[type=submit]').textContent = 'Установить структуру';
 }
