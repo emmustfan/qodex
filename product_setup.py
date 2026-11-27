@@ -63,16 +63,21 @@ def apply(db, default_entities, non_pnl_articles):
     if installed(db):
         return False
 
-    existing_projects = {row["name"].casefold(): row for row in db.execute("SELECT name,parent FROM projects")}
+    existing_projects = {row[0].casefold(): row[0] for row in db.execute("SELECT name FROM projects")}
     names = {}
     for name, parent, unit in PRODUCTS:
         previous = existing_projects.get(name.casefold())
         root = names.get(parent)
         if previous:
-            actual_name = previous["name"]
-            if previous["parent"] is not None and previous["parent"] != root:
-                raise ValueError(f'У проекта «{actual_name}» уже задан другой родительский продукт.')
-            db.execute("UPDATE projects SET parent=?,license_unit=COALESCE(license_unit,?) WHERE name=?",
+            actual_name = previous
+            if root and db.execute("""
+                WITH RECURSIVE ancestors(name) AS (
+                  VALUES(?) UNION SELECT p.parent FROM projects p JOIN ancestors a ON p.name=a.name
+                  WHERE p.parent IS NOT NULL
+                ) SELECT 1 FROM ancestors WHERE name=?
+            """, (root,actual_name)).fetchone():
+                root = None
+            db.execute("UPDATE projects SET parent=COALESCE(parent,?),license_unit=COALESCE(license_unit,?) WHERE name=?",
                        (root, unit, actual_name))
         else:
             actual_name = name
@@ -111,7 +116,13 @@ def apply(db, default_entities, non_pnl_articles):
     for name, direction, group, block in CATALOG:
         previous = existing_articles.get(name.casefold())
         if previous and previous["direction"] != direction:
-            raise ValueError(f'У статьи «{name}» уже задано другое направление.')
+            label = name + (" (доход)" if direction == "income" else " (расход)")
+            name, suffix = label, 2
+            previous = existing_articles.get(name.casefold())
+            while previous and previous["direction"] != direction:
+                name = f"{label} {suffix}"
+                suffix += 1
+                previous = existing_articles.get(name.casefold())
         if previous and previous["archived"]:
             continue
         group_key = group.casefold()

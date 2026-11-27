@@ -11,22 +11,6 @@ function projectInScope(name,scope = project) {
   return !scope || name === scope || projectAncestors(name).includes(scope);
 }
 
-function productStructureSetup() {
-  const form = modal('Установить структуру продуктов',
-    '<p>Добавим ТКО, Ро-бот с модулями Жильё, ГИС ЖКХ и Коммерция, Tracker и TONN с Signal и Gravity.</p>'
-    + '<p>Появятся статьи лицензий, оборудования, монтажа, данных, зарплаты, премий и аутсорс-бухгалтерии.</p>'
-    + '<small>Существующие суммы, статьи операций и бюджеты сохранятся. Названия ООО подставятся вместо стандартных.</small>',
-    async () => {
-      await api('install-product-structure',{});
-      period = productPlanStart;
-      project = '';
-      version = '';
-      view = 'profit';
-      return 'Структура продуктов готова. Открыт БДР за ноябрь.';
-    });
-  form.querySelector('[type=submit]').textContent = 'Установить структуру';
-}
-
 function weightedExpenseFields() {
   return `<details class="weighted-expense">
     <summary>Распределить по часам или операциям</summary>

@@ -4,6 +4,7 @@ import json
 import re
 
 STAGES = {"revenue", "variable", "direct", "project", "office", "after"}
+MAX_BLOCKS = 80
 DEFAULT_BLOCKS = [
     {"id": "revenue", "stage": "revenue", "name": "Выручка проектов"},
     {"id": "direct", "stage": "direct", "name": "Прямые затраты"},
@@ -37,7 +38,7 @@ def add_after_profit_block(db):
     current = read(db)
     if any(block["stage"] == "after" for block in current["blocks"]):
         return
-    if len(current["blocks"]) >= 60:
+    if len(current["blocks"]) >= MAX_BLOCKS:
         return
     ids = {block["id"] for block in current["blocks"]}
     names = {block["name"].casefold() for block in current["blocks"]}
@@ -54,8 +55,8 @@ def add_after_profit_block(db):
 
 def validate(payload, articles):
     blocks, assignments = payload["blocks"], payload["assignments"]
-    if not isinstance(blocks, list) or len(blocks) > 60:
-        raise ValueError("В шаблоне может быть до 60 блоков.")
+    if not isinstance(blocks, list) or len(blocks) > MAX_BLOCKS:
+        raise ValueError(f"В шаблоне может быть до {MAX_BLOCKS} блоков.")
     if not isinstance(assignments, list) or len(assignments) > 2 * len(articles):
         raise ValueError("Проверьте привязки статей.")
     by_id = {}

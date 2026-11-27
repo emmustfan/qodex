@@ -54,6 +54,14 @@ def state_snapshot(pg, write):
     return bytes(row[0]) if row is not None else None
 
 
+def initialize_snapshot(path, saved):
+    if saved is not None:
+        path.write_bytes(saved)
+    else:
+        path.unlink(missing_ok=True)
+    return qodex.init(seed=False, bootstrap=bootstrap_owner() if saved is None else {})
+
+
 def run_with_database(request, action, write):
     url = (
         os.environ.get("DATABASE_URL") or os.environ.get("POSTGRES_URL")
@@ -68,14 +76,18 @@ def run_with_database(request, action, write):
         saved = state_snapshot(pg, write)
         with TemporaryDirectory(prefix="qodex-") as directory:
             path = Path(directory) / "workspace.sqlite3"
-            if saved is not None:
-                path.write_bytes(saved)
             token = qodex.request_database.set(path)
             try:
-                qodex.init(seed=False, bootstrap=bootstrap_owner() if saved is None else {})
+                migrated = initialize_snapshot(path, saved)
+                if migrated and saved is not None and not write:
+                    # A read can discover the one-time migration while another worker is writing.
+                    latest = state_snapshot(pg, True)
+                    if latest != saved:
+                        saved = latest
+                        migrated = initialize_snapshot(path, saved)
                 action()
                 # Return the buffered HTTP response only after Postgres commits.
-                if saved is None or (write and 200 <= request.response[0] < 300):
+                if migrated or saved is None or (write and 200 <= request.response[0] < 300):
                     snapshot = path.read_bytes()
                     if snapshot != saved:
                         pg.execute("""

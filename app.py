@@ -305,6 +305,7 @@ def init(*, seed=None, bootstrap=None):
 
         month_workspace.initialize(db, NON_OPERATING)
         period_close.install_locks(db)
+        return product_setup.apply(db, ENTITIES, (*NON_OPERATING, *CASH_STAGES))
 
 
 def money(value, allow_zero=False):

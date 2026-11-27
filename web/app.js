@@ -645,11 +645,11 @@ function directories() {
   });
   const companies = legalOptions().map(([id,label]) =>
     `<tr><td>${esc(label)}</td><td>${button('Переименовать','rename-entity:' + id)}</td></tr>`);
-  return header('Справочники','Проекты, статьи и основные клиенты', data.productStructure ? '' : button('Установить структуру продуктов','install-product-structure',true)) + articleDirectory()
-    + '<div class="calendar-gap"></div><div class="directory-grid">'
+  return header('Справочники','Проекты, статьи и основные клиенты') + '<div class="directory-grid">'
     + table('Проекты',['Название',''],names,'Проектов пока нет.',button('+ Проект','project',true))
     + table('Клиенты',['Основной клиент','Плательщики из поступлений'],clients,'Добавьте клиента здесь или в карточке поступления.',button('+ Клиент','client',true))
-    + '</div><div class="calendar-gap"></div>' + table('Юридические лица',['Название',''],companies);
+    + '</div><div class="calendar-gap"></div>' + articleDirectory()
+    + '<div class="calendar-gap"></div>' + table('Юридические лица',['Название',''],companies);
 }
 
 function render() {
@@ -981,7 +981,6 @@ function doAction(action) {
   const amount = (value = '',extra = '') => field('Сумма, ₽','amount','number',value,`step="0.01" required ${extra}`);
   const category = articles => selectField('ООО','entity',legalOptions(),entity) + `<div class="fields">${picker('Проект','project',activeProjects(),project)}${picker('Статья','article',articles)}</div>`;
   const save = (title,fields) => modal(title,fields,values => api(kind,{...Object.fromEntries(values),basis:arg,scenario}));
-  if (kind === 'install-product-structure') productStructureSetup();
   if (kind === 'project') save('Новый проект',field('Название проекта','name','text','','maxlength="100" required')
     + selectField('Родительский продукт','parent',[['','Самостоятельный продукт'],...activeProjects().filter(name => name !== 'Офис').map(name => [name,name])],'',false)
     + field('Единица лицензии','licenseUnit','text','','maxlength="80"'));
