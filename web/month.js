@@ -10,7 +10,7 @@ function workingMonthScope() {
 }
 
 const monthMoney = amount => amount === null ? '—' : rub(amount);
-const reviewProject = row => !project || row.project === project;
+const reviewProject = row => projectInScope(row.project);
 const monthDateLabel = day => new Intl.DateTimeFormat('ru-RU',{day:'numeric',month:'short',timeZone:'UTC'}).format(new Date(day));
 
 function workingMonth() {
@@ -228,7 +228,7 @@ function monthRules(scope, review, closed) {
 }
 
 function monthTasks(review) {
-  const rows = review.actions.filter(row => !project || !row.project || row.project === project).map(row => `<tr>
+  const rows = review.actions.filter(row => !row.project || projectInScope(row.project)).map(row => `<tr>
     <td>${esc(row.day)}</td><td class="wrap">${esc(row.title)}<small>${esc([row.project,row.assignee].filter(Boolean).join(' · '))}</small></td>
     <td><span class="pill ${row.done ? '' : 'pending'}">${row.done ? 'Готово' : 'В работе'}</span></td>
     <td>${button('Изменить','month-action-edit:' + row.id)} ${button(row.done ? 'Вернуть в работу' : 'Готово','month-action-status:' + row.id)}</td></tr>`);

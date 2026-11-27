@@ -3,7 +3,7 @@
 import json
 import re
 
-STAGES = {"revenue", "direct", "project", "office", "after"}
+STAGES = {"revenue", "variable", "direct", "project", "office", "after"}
 DEFAULT_BLOCKS = [
     {"id": "revenue", "stage": "revenue", "name": "Выручка проектов"},
     {"id": "direct", "stage": "direct", "name": "Прямые затраты"},
@@ -76,7 +76,7 @@ def validate(payload, articles):
             raise ValueError("Проверьте привязку статьи к блоку.")
         income = articles[article] == "income"
         expected = ({"office"} if income else {"office", "after"}) if scope == "office" else (
-            {"revenue"} if income else {"direct", "project", "after"})
+            {"revenue"} if income else {"variable", "direct", "project", "after"})
         if stage not in expected or (article, scope) in routes:
             raise ValueError(f'Для статьи «{article}» выберите один подходящий блок в каждом разрезе.')
         routes[article, scope] = {"article": article, "scope": scope, "block": block_id}

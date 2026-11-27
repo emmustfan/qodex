@@ -69,3 +69,10 @@ dialog .batch-confirm{display:flex;align-items:center;gap:9px}
 #month-rules td:not(:first-child),#month-rules th{white-space:normal}
 @media(max-width:760px){.month-receipts{grid-template-columns:repeat(2,minmax(0,1fr))}}
 @media(max-width:760px){.pnl-stage-grid{grid-template-columns:1fr}}
+.weighted-expense{padding:12px;border:1px solid var(--border);border-radius:10px}
+.weighted-expense summary{cursor:pointer;font-weight:650}
+.weighted-expense[open]>:not(summary){margin-top:8px}
+.weighted-rows{display:grid;gap:8px}
+.weighted-row{align-items:end;grid-template-columns:minmax(0,1.5fr) minmax(0,1fr) auto}
+.weighted-expense .actions{justify-content:flex-start}
+@media(max-width:600px){.weighted-row{grid-template-columns:1fr 1fr}.weighted-row button{justify-self:start}}

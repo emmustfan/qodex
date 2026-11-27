@@ -22,6 +22,7 @@ import user_accounts
 import directory_admin
 import report_export
 import month_workspace
+import product_setup
 
 ROOT = Path(__file__).resolve().parent
 DB = Path(os.environ.get("QODEX_DB", ROOT / "data" / "finance.sqlite3"))
@@ -45,7 +46,7 @@ ASSETS = {"/": ("index.html", "text/html"), "/style.css": ("style.css", "text/cs
           "/app.js": ("app.js", "text/javascript"), "/pnl.js": ("pnl.js", "text/javascript"),
           "/schedules.js": ("schedules.js", "text/javascript"), "/release.js": ("release.js", "text/javascript"),
           "/workspace.js": ("workspace.js", "text/javascript"), "/month.js": ("month.js", "text/javascript"),
-          "/articles.js": ("articles.js", "text/javascript")}
+          "/articles.js": ("articles.js", "text/javascript"), "/products.js": ("products.js", "text/javascript")}
 
 
 def pnl_articles(directions):
@@ -230,6 +231,8 @@ def init(*, seed=None, bootstrap=None):
         db.execute("BEGIN IMMEDIATE")
         for table, column, definition in (
             ("projects", "archived", "INTEGER NOT NULL DEFAULT 0"),
+            ("projects", "parent", "TEXT REFERENCES projects(name) ON DELETE RESTRICT"),
+            ("projects", "license_unit", "TEXT"),
             ("articles", "archived", "INTEGER NOT NULL DEFAULT 0"),
             ("articles", "group_id", "INTEGER REFERENCES article_groups(id) ON DELETE RESTRICT"),
             ("articles", "default_project", "TEXT REFERENCES projects(name) ON DELETE RESTRICT"),
@@ -327,6 +330,26 @@ def ensure_project(db, project, allow_archived=False):
 
 def allow_article(direction, amount):
     return direction == "both" or direction == ("income" if amount > 0 else "expense")
+
+
+def weighted_expense(db, amount, payload):
+    basis, weights = payload["basis"], payload["weights"]
+    if amount >= 0 or basis not in ("hours", "operations") or not isinstance(weights, list) or len(weights) < 2:
+        raise ValueError("Для распределения списания укажите базу и хотя бы два проекта.")
+    by_project = {}
+    for row in weights:
+        project = row["project"]
+        ensure_project(db, project)
+        value = money(row["value"])
+        if project in by_project or value <= 0 or (basis == "operations" and value % 100):
+            raise ValueError("Укажите разные проекты и положительные доли. Количество операций должно быть целым.")
+        by_project[project] = value
+    total = sum(by_project.values())
+    shares = {project: divmod(-amount * value, total) for project, value in by_project.items()}
+    residual = -amount - sum(cents for cents, _ in shares.values())
+    extra = set(sorted(shares, key=lambda name: shares[name][1], reverse=True)[:residual])
+    return {project: -cents - (project in extra) for project, (cents, _) in shares.items()
+            if cents or project in extra}
 
 
 def ensure_article(db, article, amount, accrual=False, allow_archived=False):
@@ -1124,9 +1147,22 @@ def mutate(db, action, payload, actor, role):
     elif action == "directory-change":
         directory_admin.change(db, payload["category"], payload["name"], payload["mode"])
         target = f'{payload["category"]}:{payload["name"]}:{payload["mode"]}'
+    elif action == "install-product-structure":
+        if not product_setup.apply(db, ENTITIES, (*NON_OPERATING, *CASH_STAGES)):
+            return result
+        target = product_setup.SETUP_KEY
     elif action == "project":
         name = directory_name(db, "projects", payload["name"])
-        target = str(db.execute("INSERT INTO projects(name) VALUES(?)", (name,)).lastrowid)
+        parent = payload.get("parent") or None
+        if parent:
+            ensure_project(db, parent)
+            if parent == "Офис":
+                raise ValueError("В качестве родительского выберите продукт.")
+        license_unit = (payload.get("licenseUnit") or "").strip()
+        if len(license_unit) > 80:
+            raise ValueError("Укажите единицу лицензии до 80 символов.")
+        target = str(db.execute("INSERT INTO projects(name,parent,license_unit) VALUES(?,?,?)",
+                                (name, parent, license_unit or None)).lastrowid)
     elif action == "article":
         name = directory_name(db, "articles", payload["name"])
         direction = payload["direction"]
@@ -1266,6 +1302,11 @@ def mutate(db, action, payload, actor, role):
     elif action == "import":
         result = import_statement(db, payload["csv"], account_id(db, payload["account"]))
         target = str(result["imported"])
+    elif action == "preview-weighted-expense":
+        operation = db.execute("SELECT amount FROM operations WHERE id=?", (int(payload["id"]),)).fetchone()
+        if operation is None:
+            raise ValueError("Операция не найдена.")
+        return {"shares": weighted_expense(db, operation["amount"], payload)}
     elif action == "allocate":
         oid = int(payload["id"])
         if is_profit_payment(db, oid):
@@ -1308,6 +1349,11 @@ def mutate(db, action, payload, actor, role):
 
         if not rows or sum(row[3] for row in rows) != op["amount"] or any(row[3] * op["amount"] <= 0 for row in rows):
             raise ValueError("Сумма строк и знак должны совпадать с суммой операции.")
+        weights = payload.get("weighted")
+        if weights:
+            expected = weighted_expense(db, op["amount"], weights)
+            if len(rows) != len(expected) or {row[1]: row[3] for row in rows} != expected:
+                raise ValueError("Доли изменились. Пересчитайте распределение по базе.")
         linked = db.execute("""
             SELECT r.project,r.article FROM request_payments p JOIN requests r ON r.id=p.request
             WHERE p.operation=?
@@ -1335,6 +1381,10 @@ def mutate(db, action, payload, actor, role):
         db.execute("DELETE FROM allocations WHERE operation=?", (oid,))
         db.executemany("INSERT INTO allocations(operation,project,article,amount,accrual,accrual_article,bonus_month) VALUES(?,?,?,?,?,?,?)", rows)
         target = str(oid)
+        if weights:
+            basis = 'Часы' if weights['basis'] == 'hours' else 'Операции'
+            details = ', '.join(f'{row["project"]} — {row["value"]}' for row in weights['weights'])
+            target = f"{oid} · {basis} · {details}"
     elif action == "balance":
         target = payload["project"]
         if target:
@@ -1603,7 +1653,7 @@ class Handler(BaseHTTPRequestHandler):
                 data["requestAttachments"] = [dict(row) for row in db.execute("""
                     SELECT id,request,actor,name,created FROM request_attachments ORDER BY id
                 """) if row["request"] in visible]
-                project_rows = db.execute("SELECT name,archived FROM projects ORDER BY name='Офис', id").fetchall()
+                project_rows = db.execute("SELECT name,archived,parent,license_unit FROM projects ORDER BY name='Офис', id").fetchall()
                 projects = [row["name"] for row in project_rows]
                 articles = db.execute("SELECT name,direction,archived FROM articles ORDER BY id").fetchall()
                 directions = {row["name"]: row["direction"] for row in articles}
@@ -1617,6 +1667,10 @@ class Handler(BaseHTTPRequestHandler):
                             archivedProjects=[row["name"] for row in project_rows if row["archived"] and row["name"] in projects],
                             archivedArticles=[row["name"] for row in articles if row["archived"]],
                             scenarios=SCENARIOS, user=name, role=role, demo=not users, authProxy=bool(PROXY_TOKEN))
+                if finance:
+                    data["projectParents"] = {row["name"]: row["parent"] for row in project_rows if row["parent"]}
+                    data["licenseUnits"] = {row["name"]: row["license_unit"] for row in project_rows if row["license_unit"]}
+                    data["productStructure"] = product_setup.installed(db)
                 return self.reply(200, data)
         if path in ASSETS:
             return self.send_data(200, *read_asset(path))

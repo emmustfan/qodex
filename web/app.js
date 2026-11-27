@@ -97,7 +97,7 @@ function totals(rows) {
 }
 
 function filterRows(rows, month = period, currentProject = project) {
-  return rows.filter(row => row.month === month && (!currentProject || row.project === currentProject));
+  return rows.filter(row => row.month === month && projectInScope(row.project,currentProject));
 }
 
 function header(title, subtitle, actions = '') {
@@ -135,7 +135,7 @@ function operationTable(compact = false) {
     const lines = byOperation.get(op.id) || [];
     if (!compact && operationFilter === 'documents' && !op.document_pending) return false;
     if (!compact && operationFilter === 'pending' && (lines.length || paired.has(op.id) || paid.has(op.id))) return false;
-    if (!op.day.startsWith(period) || (project && (paid.has(op.id) || !lines.some(line => line.project === project)))) return false;
+    if (!op.day.startsWith(period) || (project && (paid.has(op.id) || !lines.some(line => projectInScope(line.project))))) return false;
     if (compact || !terms.length) return true;
     const searchable = [op.description,op.counterparty,op.payer_label,clientName(op.client || op.suggested_client)]
       .join(' ').toLocaleLowerCase('ru');
@@ -144,7 +144,7 @@ function operationTable(compact = false) {
   const linked = compact ? null : new Set([...data.request_payments,...data.accrual_schedule_payments].map(row => row.operation));
   const rows = (compact ? items.slice(0,5) : items).map(op => {
     const allLines = byOperation.get(op.id) || [];
-    const lines = allLines.filter(line => !project || project === line.project);
+    const lines = allLines.filter(line => projectInScope(line.project));
     const amount = project ? totals(lines).net : op.amount;
     const dividend = paid.get(op.id);
     const hint = [op.suggested_project,op.suggested_article].filter(Boolean).join(' · ');
@@ -264,17 +264,19 @@ function overview() {
   const cash = cashRows();
   const current = totals(filterRows(cash));
   const result = totals(filterRows(profitRows()));
-  const opening = !entity && !account && data.balances.find(row => row.project === project && row.day.slice(0,7) <= period);
+  const hasChildren = Object.values(data.projectParents || {}).includes(project);
+  const opening = !hasChildren && !entity && !account && data.balances.find(row => row.project === project && row.day.slice(0,7) <= period);
   const selectedAccounts = data.accounts.filter(item => inScope(item.id));
   const starts = new Map(data.account_balances.filter(row => row.day.slice(0,7) <= period).map(row => [row.account,row]));
   const reconciled = !project && selectedAccounts.length > 0 && selectedAccounts.every(item => starts.has(item.id)) && (entity || account || data.operations.every(op => op.account || op.day.slice(0,7) > period));
-  const history = cashRows(true).filter(row => row.month <= period && (!project || row.project === project));
+  const history = cashRows(true).filter(row => row.month <= period && projectInScope(row.project));
   const cumulative = reconciled ? selectedAccounts.reduce((sum,item) => {
     const start = starts.get(item.id);
     return sum + start.amount + totals(history.filter(row => row.account === item.id && row.day >= start.day)).net;
   },0) : (opening?.amount ?? 0) + totals(history.filter(row => !opening || row.day >= opening.day)).net;
   const costs = totals(filterRows(cash,period,'Офис')).outgoing;
-  const impact = data.projects.map(name => ({name,...totals(filterRows(cash,period,name))}));
+  const impact = data.projects.filter(name => project ? name === project || data.projectParents?.[name] === project : !data.projectParents?.[name])
+    .map(name => ({name,...totals(filterRows(cash,period,name))}));
   const maximum = Math.max(1,...impact.map(item => item.incoming + item.outgoing));
   return header('Обзор финансов','Движение денег и результат по проектам',(account ? button('Входящий остаток','account-balance:' + account) : !entity ? button('Входящий остаток','balance') : button('Счета и остатки','view:accounts')) + button('↑ Импорт выписки','import') + button('+ Новая заявка','request',true)) + filters()
     + `<div class="metrics">${card(reconciled ? 'Остаток по счетам' : opening ? (project ? 'Остаток по проекту' : 'Остаток группы') : 'Чистый поток накопленно',rub(cumulative),reconciled ? 'С учётом входящих остатков по счетам' : opening ? `Входящий остаток на ${esc(opening.day)}` : 'С начала загруженной истории')}${card('Поступления',rub(current.incoming),'Факт за месяц')}${card('Выплаты',rub(current.outgoing),'Факт за месяц')}${card('Результат БДР',rub(result.net),result.incoming ? `Рентабельность ${(result.net/result.incoming*100).toFixed(1)}%` : 'Рентабельность без выручки не считается')}</div>
@@ -354,7 +356,7 @@ function requests() {
 function calendar() {
   const today = new Date().toLocaleDateString('sv-SE');
   const open = data.requests.filter(item => item.status === 'Согласована'
-    && outstanding(item) && inEntity(item.entity) && (!project || item.project === project));
+    && outstanding(item) && inEntity(item.entity) && projectInScope(item.project));
   const due = open.filter(item => dueDate(item).startsWith(period));
   const late = open.filter(item => dueDate(item) < today);
   const amount = items => items.reduce((sum,item) => sum + outstanding(item),0);
@@ -631,7 +633,8 @@ function accountReport() {
 }
 
 function directories() {
-  const names = data.projects.map((name,index) => `<tr><td>${esc(name)}${data.archivedProjects.includes(name) ? '<small>В архиве</small>' : ''}</td>
+  const names = data.projects.map((name,index) => `<tr><td>${esc(name)}${data.archivedProjects.includes(name) ? '<small>В архиве</small>' : ''}
+    ${data.projectParents[name] || data.licenseUnits[name] ? `<small>${esc([data.projectParents[name],data.licenseUnits[name] && 'Единица лицензии — ' + data.licenseUnits[name]].filter(Boolean).join(' · '))}</small>` : ''}</td>
     <td>${directoryControls('projects',name,index)}</td></tr>`);
   const payers = Map.groupBy(data.client_payers,row => row.client);
   const receipts = Map.groupBy(data.operations.filter(op => op.amount > 0 && op.client),op => op.client);
@@ -642,7 +645,7 @@ function directories() {
   });
   const companies = legalOptions().map(([id,label]) =>
     `<tr><td>${esc(label)}</td><td>${button('Переименовать','rename-entity:' + id)}</td></tr>`);
-  return header('Справочники','Проекты, статьи и основные клиенты') + articleDirectory()
+  return header('Справочники','Проекты, статьи и основные клиенты', data.productStructure ? '' : button('Установить структуру продуктов','install-product-structure',true)) + articleDirectory()
     + '<div class="calendar-gap"></div><div class="directory-grid">'
     + table('Проекты',['Название',''],names,'Проектов пока нет.',button('+ Проект','project',true))
     + table('Клиенты',['Основной клиент','Плательщики из поступлений'],clients,'Добавьте клиента здесь или в карточке поступления.',button('+ Клиент','client',true))
@@ -767,10 +770,13 @@ function allocation(op) {
   const help = schedule ? 'Оплата связана с графиком. Начисление подтверждается в графике.' : incoming
     ? 'Месяц БДР укажите, когда выручка заработана. Для этапов оплаты статья БДР по умолчанию — «Выручка по проекту».'
     : 'Пустой месяц БДР оставляет строку только в БДДС. Для уже отражённого ручного начисления оставьте месяц пустым.';
+  const weighted = !incoming && !schedule && !previous.some(row => row.bonus_month)
+    && !data.request_payments.some(row => row.operation === op.id);
   const form = modal(incoming ? 'Распределение поступления' : 'Распределение операции',
     `<p class="subtitle">${esc([incoming ? '' : op.counterparty,op.description,rub(op.amount),op.day].filter(Boolean).join(' · '))}</p>${clientFields}
     <small>${help}</small><div id="lines">${(previous.length ? previous : [initial]).map(makeRow).join('')}</div>
-    <div class="row"><button class="button" type="button" id="add-line">+ Доля проекта</button><strong id="remaining"></strong></div>${checks}`,
+    <div class="row"><button class="button" type="button" id="add-line">+ Доля проекта</button><strong id="remaining"></strong></div>
+    ${weighted ? weightedExpenseFields() : ''}${checks}`,
   async (values,form) => {
     const lines = [...form.querySelectorAll('.split')].map(row => Object.fromEntries([...row.querySelectorAll('input,select')].map(input => [input.name,input.value])));
     const extra = incoming ? {
@@ -778,7 +784,7 @@ function allocation(op) {
       newClient:values.get('client') === 'new' ? values.get('newClient') : '',
       payer:values.get('payer'),rememberClient:values.has('rememberClient')
     } : {};
-    await api('allocate',{id:op.id,lines,documentPending:values.has('documentPending'),remember:values.has('remember'),...extra});
+    await api('allocate',{id:op.id,lines,documentPending:values.has('documentPending'),remember:values.has('remember'),weighted:weightedBasis(),...extra});
   });
   const update = () => {
     for (const row of form.querySelectorAll('.split')) {
@@ -833,6 +839,7 @@ function allocation(op) {
     useArticleProject(row.querySelector('[name=article]').value,row.querySelector('[name=project]'));
   }
   update();
+  const weightedBasis = initWeightedExpense(form,op,makeRow,update);
 }
 
 function showStatementResult(result) {
@@ -914,7 +921,7 @@ function bankSuggestions() {
   const paired = transferMap();
   const paid = profitPaymentMap();
   return data.operations.filter(op => inScope(op.account) && op.day.startsWith(period) && matchesDirection(op)
-    && (!project || project === op.suggested_project) && op.suggested_project && op.suggested_article
+    && projectInScope(op.suggested_project) && op.suggested_project && op.suggested_article
     && !allocated.has(op.id) && !paired.has(op.id) && !paid.has(op.id));
 }
 
@@ -974,7 +981,10 @@ function doAction(action) {
   const amount = (value = '',extra = '') => field('Сумма, ₽','amount','number',value,`step="0.01" required ${extra}`);
   const category = articles => selectField('ООО','entity',legalOptions(),entity) + `<div class="fields">${picker('Проект','project',activeProjects(),project)}${picker('Статья','article',articles)}</div>`;
   const save = (title,fields) => modal(title,fields,values => api(kind,{...Object.fromEntries(values),basis:arg,scenario}));
-  if (kind === 'project') save('Новый проект',field('Название проекта','name','text','','maxlength="100" required'));
+  if (kind === 'install-product-structure') productStructureSetup();
+  if (kind === 'project') save('Новый проект',field('Название проекта','name','text','','maxlength="100" required')
+    + selectField('Родительский продукт','parent',[['','Самостоятельный продукт'],...activeProjects().filter(name => name !== 'Офис').map(name => [name,name])],'',false)
+    + field('Единица лицензии','licenseUnit','text','','maxlength="80"'));
   if (kind === 'client') save('Новый клиент',field('Название клиента','name','text','','maxlength="100" required'));
   if (kind === 'allocate') allocation(data.operations.find(op => op.id === Number(arg)));
   if (kind === 'batch-allocate') openBatchAllocation();
@@ -1161,5 +1171,6 @@ content.addEventListener('input',event => {
 api('state').then(state => {
   data = state;
   if (data.operations?.length) period = data.operations.map(item => item.day.slice(0,7)).sort().at(-1);
+  if (data.productStructure && period < productPlanStart) period = productPlanStart;
   render();
 }).catch(error => {content.textContent = error.message;});

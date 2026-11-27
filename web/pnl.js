@@ -6,7 +6,7 @@ function pnlStageAccepts(stage,scope,amount) {
   if (stage === 'after') return amount < 0;
   if (scope === 'office') return stage === 'office';
   if (amount > 0) return stage === 'revenue';
-  return stage === 'direct' || stage === 'project';
+  return stage === 'variable' || stage === 'direct' || stage === 'project';
 }
 
 function pnlDefaultBlock(blocks,scope,amount) {
@@ -83,21 +83,57 @@ function pnlStructure(plan,fact) {
       || (order.get(a.block.id) ?? blocks.length) - (order.get(b.block.id) ?? blocks.length))
     .map(list => ({id:list[0].block.id,label:list[0].block.name,entries:list,children:groupedArticleNodes(list)}));
   const branches = (rows,id,label,children) => rows.length ? [{id,label,entries:rows,children,open:true}] : [];
-  const perProject = [...Map.groupBy(projects,entry => entry.row.project).entries()]
+  const marginCoverage = data.productStructure && period >= productPlanStart;
+  const projectEntries = Map.groupBy(projects,entry => entry.row.project);
+  if (marginCoverage) {
+    const parents = new Set(Object.values(data.projectParents));
+    for (const name of activeProjects()) {
+      if (name !== 'Офис' && (Object.hasOwn(data.licenseUnits,name) || parents.has(name))
+          && projectInScope(name) && !projectEntries.has(name)) projectEntries.set(name,[]);
+    }
+  }
+  const perProject = [...projectEntries.entries()]
     .sort(([a],[b]) => (a || '').localeCompare(b || '','ru'));
-  const nodes = perProject.map(([name,rows]) => {
+  const roots = new Map();
+  for (const [name,rows] of perProject) {
+    const path = projectAncestors(name).reverse();
+    const visiblePath = project && path.includes(project) ? path.slice(path.indexOf(project)) : path;
+    let level = roots;
+    for (const segment of visiblePath) {
+      if (!level.has(segment)) level.set(segment,{name:segment,own:[],entries:[],children:new Map()});
+      const node = level.get(segment);
+      node.entries.push(...rows);
+      if (segment === name) node.own = rows;
+      level = node.children;
+    }
+  }
+  const coverage = rows => rows.filter(entry => ['revenue','variable'].includes(entry.block.stage));
+  const component = (rows,id,label) => rows.length ? branches(rows,id,label,blockNodes(rows))
+    : marginCoverage ? [{id,label,entries:[]}] : [];
+  const components = rows => {
     const income = rows.filter(entry => entry.block.stage === 'revenue');
-    const expense = rows.filter(entry => entry.block.stage !== 'revenue');
-    return {id:'project-' + name,label:name || 'Без проекта',entries:rows,open:true,project:true,children:[
-      ...branches(income,'income','Доходы',blockNodes(income)),
-      ...branches(expense,'expense','Расходы',blockNodes(expense)),
-      summary('adjusted','Скорректированный доход',rows)
-    ]};
-  });
-  if (perProject.length > 1) nodes.push(summary('all-projects','Скорректированный доход проектов',projects));
-  nodes.push(...branches(office,'office','Офис',blockNodes(office)));
-  if (!project && (projects.length || office.length || after.length)) {
-    nodes.push(summary('operating-margin','Маржинальная прибыль',[...projects,...office]));
+    const variable = rows.filter(entry => entry.block.stage === 'variable');
+    const fixed = rows.filter(entry => !['revenue','variable'].includes(entry.block.stage));
+    return [
+      ...component(income,'income','Доходы'),
+      ...component(variable,'variable','Переменные расходы'),
+      ...(marginCoverage || variable.length ? [summary('coverage','Маржа покрытия',coverage(rows))] : []),
+      ...component(fixed,'expense','Остальные расходы продукта')
+    ];
+  };
+  const productNode = node => ({id:'project-' + node.name,label:node.name || 'Без проекта',entries:node.entries,open:true,project:true,children:[
+    ...(node.children.size ? [
+      ...branches(node.own,'shared','Общее по продукту',components(node.own)),...Array.from(node.children.values(),productNode),
+      ...(marginCoverage || node.entries.some(entry => entry.block.stage === 'variable')
+        ? [summary('coverage','Маржа покрытия продукта',coverage(node.entries))] : [])
+    ] : components(node.own)),
+    summary('adjusted','Скорректированный доход',node.entries)
+  ]});
+  const nodes = Array.from(roots.values(),productNode);
+  if (roots.size > 1) nodes.push(summary('all-projects','Скорректированный доход проектов',projects));
+  if (!project || project === 'Офис') nodes.push(...component(office,'office','Офис'));
+  if (!project && (projects.length || office.length || after.length || marginCoverage)) {
+    nodes.push(summary('operating-margin',data.productStructure ? 'Результат после офиса' : 'Маржинальная прибыль',[...projects,...office]));
   }
   const afterBlocks = blockNodes(after).map(node => ({
     ...node,
@@ -106,7 +142,7 @@ function pnlStructure(plan,fact) {
     }))
   }));
   nodes.push(...branches(after,'after','Расходы после маржинальной прибыли',afterBlocks));
-  if (entries.length) nodes.push(summary('result','Операционный результат',entries));
+  if (entries.length || nodes.length) nodes.push(summary('result','Операционный результат',entries));
   if (!project) {
     const dividends = data.profit_decisions.filter(row => inEntity(row.entity) && row.month === period && !row.canceled && !row.fund)
       .map(row => ({kind:'Факт',row:{...row,article:'Дивиденды',description:row.note,amount:-row.amount}}));

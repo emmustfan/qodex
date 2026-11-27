@@ -1,7 +1,7 @@
 const scheduleForOperation = operation => data.accrual_schedule_payments.find(row => row.operation === operation)?.schedule;
 
 function scheduleReport() {
-  const schedules = data.accrual_schedules.filter(row => inEntity(row.entity) && (!project || row.project === project));
+  const schedules = data.accrual_schedules.filter(row => inEntity(row.entity) && projectInScope(row.project));
   const byId = new Map(schedules.map(item => [item.id,item]));
   const confirmed = new Set(data.accruals.map(row => row.schedule_month));
   const bySchedule = Map.groupBy(data.schedule_months,row => row.schedule);

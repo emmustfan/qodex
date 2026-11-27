@@ -8,7 +8,7 @@ TABLES = {
         ("bank_rules", "project"), ("accrual_schedules", "project"), ("balances", "project"),
         ("office_contributions", "project"), ("forecast_entries", "project"),
         ("monthly_rules", "project"), ("bonus_confirmations", "project"), ("weekly_actions", "project"),
-        ("articles", "default_project"),
+        ("articles", "default_project"), ("projects", "parent"),
     ),
     "articles": (
         ("allocations", "article"), ("allocations", "accrual_article"), ("accruals", "article"),
