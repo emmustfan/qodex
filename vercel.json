@@ -9,6 +9,7 @@
     }
   },
   "rewrites": [
+    { "source": "/", "destination": "/api/index" },
     { "source": "/:path*", "destination": "/api/index?_qodex_path=/:path*" }
   ]
 }
